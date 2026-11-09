@@ -14,11 +14,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install PyInstaller
-        run: pip install pyinstaller
+      - name: Install build dependencies
+        run: pip install pyinstaller tkinterdnd2
 
       - name: Build exe
-        run: pyinstaller --onefile --windowed --name OkibaBoard OkibaBoard.py
+        run: pyinstaller --onefile --windowed --collect-all tkinterdnd2 --name OkibaBoard OkibaBoard.py
 
       - name: Smoke test (headless self-test)
         shell: pwsh
