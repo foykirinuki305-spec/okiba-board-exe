@@ -1,37 +1,46 @@
 # -*- coding: utf-8 -*-
 """
-OkibaBoard v3 - Deskboard-style board app (Python + Tkinter, stdlib only)
+OkibaBoard v4 - Deskboard-style board app (Python + Tkinter, stdlib only)
 
 Model: MULTIPLE BOARDS, like files on a home screen.
 - Launch -> HOME screen (dark, desktop-like) with board icons.
-  Boards are REAL folders under ``~/Documents/OkibaBoards/``.
-  One button only: "＋ボード". Double-click a board icon to open it.
-  Right-click a board icon: rename the real folder / send the board
-  folder to the Recycle Bin. Icon positions are dragged freely
-  (NO grid, NO snapping - exactly like a real desktop) and saved to
-  ``OkibaBoards/.home.json``.
+  Boards are REAL folders under ``<SystemDrive>\\OkibaBoards``
+  (typically ``C:\\OkibaBoards``; on first run an old
+  ``~/Documents/OkibaBoards`` is moved there automatically - if the
+  move fails the old folder keeps being used, nothing is lost).
+  One button only: "＋ボード" - it ALWAYS asks for a name first, so
+  the user freely names every board (the name is the real folder
+  name; unusable characters are rejected with an explanation, never
+  silently replaced). Double-click a board icon to open it.
+  Right-click a board icon: 場所を開く / rename / Recycle Bin.
+  Board icons SNAP to a grid (vertical columns, like desktop icons)
+  and their cells are saved to ``OkibaBoards/.home.json``.
 - BOARD screen: the opened board folder's real files/folders as cards.
-  Cards are placed at COMPLETELY FREE positions (no alignment, no
-  snapping); a position the user chose is never overwritten by the
-  app - the ~2s polling re-render restores saved positions exactly.
-  Only brand-new cards get an initial free grid slot.
-  Buttons ONLY: "← もどる", "＋メモ", "＋ファイル".
-  Right-click a file card: open / rename (renames the real file) /
-  send to Recycle Bin. Double-click opens the real file.
+  Cards SNAP "ピチッと" to a grid, filling VERTICAL columns first
+  (top-to-bottom, then the next column), exactly like real desktop
+  icons. Dragging a card and letting go snaps it to the nearest cell;
+  if that cell is taken, the two cards SWAP cells. Cells are saved to
+  ``.okiba-board.json`` inside the board folder.
+  Card size is adjustable with one toolbar button "大きさ: 小/中/大"
+  (card size, grid cell and font change together; saved per board).
+  Buttons: "← もどる", "＋メモ", "＋ファイル", "大きさ: …".
+  Right-click a file card: 開く / 場所を開く / rename (renames the
+  real file) / send to Recycle Bin. Double-click opens the real file.
   Intake: native Windows drag & drop (WM_DROPFILES via ctypes, no
   external library) OR the guaranteed "＋ファイル" button. Dropped /
   chosen items enter the board folder with the Explorer rule
   (same drive = move, different drive = copy, never overwrite -
   a " (2)" suffix is added instead).
-  Positions + notes are saved to ``.okiba-board.json`` in the board
-  folder. The folder is polled every ~2 seconds so outside changes
+  The folder is polled every ~2 seconds so outside changes
   appear/disappear automatically.
 
 Headless self-test (used by CI):
     OkibaBoard.exe --self-test
-    -> exercises board base/home handling + scanning + save/load +
-       the intake helper without a GUI, writes ``self-test-ok.txt``
-       in the current directory, exits 0.
+    -> exercises base resolution + migration, grid math, board/home
+       handling, scanning, save/load and the intake helper without a
+       GUI, writes ``self-test-ok.txt``, exits 0.
+    (Set OKIBA_BASE to a temp dir to keep the test away from the
+     real C:\\ and Documents folders.)
 """
 
 import json
@@ -47,13 +56,172 @@ SELF_TEST_OK = "self-test-ok.txt"
 POLL_MS = 2000
 BASE_DIR_NAME = "OkibaBoards"
 DEFAULT_BOARD_NAME = "ボード1"
+BASE_ENV_VAR = "OKIBA_BASE"
+
+# ------------------------------------------------------------------- grid
+ORIGIN = 16  # px margin before the first cell, both screens
+
+# Board card sizes: card size, grid cell and font change together.
+BOARD_SIZES = {
+    "小": {"card_w": 110, "card_h": 64, "cell_w": 126, "cell_h": 80,
+           "font": 9},
+    "中": {"card_w": 150, "card_h": 88, "cell_w": 166, "cell_h": 104,
+           "font": 10},
+    "大": {"card_w": 200, "card_h": 116, "cell_w": 216, "cell_h": 132,
+           "font": 12},
+}
+SIZE_ORDER = ["小", "中", "大"]
+DEFAULT_SIZE = "中"
+
+# Home board icons: one fixed grid.
+HOME_ICON_W, HOME_ICON_H = 136, 108
+HOME_CELL_W, HOME_CELL_H = 152, 124
+
+
+def cell_to_pos(col, row, cell_w, cell_h):
+    """Pixel (x, y) of the top-left corner of grid cell (col, row)."""
+    return (ORIGIN + col * cell_w, ORIGIN + row * cell_h)
+
+
+def pos_to_cell(x, y, cell_w, cell_h):
+    """Nearest grid cell for pixel point (x, y); never negative."""
+    col = int(round((x - ORIGIN) / float(cell_w)))
+    row = int(round((y - ORIGIN) / float(cell_h)))
+    return (max(col, 0), max(row, 0))
+
+
+def rows_per_column(view_height, cell_h):
+    """How many cells fit vertically in *view_height* pixels."""
+    usable = max(int(view_height) - ORIGIN, cell_h)
+    return max(1, usable // cell_h)
+
+
+def iter_cells(rows_per_col):
+    """Yield cells in desktop order: fill a column top-to-bottom,
+    then move to the next column on the right."""
+    col = 0
+    while True:
+        for row in range(rows_per_col):
+            yield (col, row)
+        col += 1
+
+
+def next_free_cell(occupied, rows_per_col, start=None):
+    """First free cell in vertical-column order.
+
+    *occupied* is a set of (col, row) tuples. When *start* is given,
+    the search begins at that cell (inclusive) in the same order.
+    """
+    started = start is None
+    for cell in iter_cells(rows_per_col):
+        if not started:
+            if cell == tuple(start):
+                started = True
+            else:
+                continue
+        if cell not in occupied:
+            return cell
+    raise AssertionError("unreachable")
+
+
+def move_to_cell(cells, key, target):
+    """Move *key* to *target* cell in dict *cells* (key -> (col, row)).
+
+    If another key occupies the target, the two keys SWAP cells.
+    If the moving key had no cell yet and the target is taken, the
+    occupant keeps its place and the mover does not move (callers
+    normally place new keys via next_free_cell instead).
+    Returns the occupants-swapped key or None.
+    """
+    target = tuple(target)
+    old = cells.get(key)
+    if old is not None:
+        old = tuple(old)
+    if old == target:
+        return None
+    other = None
+    for k, v in cells.items():
+        if k != key and tuple(v) == target:
+            other = k
+            break
+    if other is not None:
+        if old is None:
+            return None
+        cells[other] = old
+    cells[key] = target
+    return other
+
+
+def _cell_from_any(value, cell_w, cell_h):
+    """Normalize a stored position to a (col, row) cell tuple.
+
+    Accepts the v4 form {"col": c, "row": r} and the legacy v3 pixel
+    form {"x": .., "y": ..} (converted with the given cell size).
+    Returns None for unusable values.
+    """
+    if not isinstance(value, dict):
+        return None
+    if "col" in value and "row" in value:
+        try:
+            return (max(int(value["col"]), 0), max(int(value["row"]), 0))
+        except Exception:
+            return None
+    if "x" in value and "y" in value:
+        try:
+            return pos_to_cell(int(value["x"]), int(value["y"]),
+                               cell_w, cell_h)
+        except Exception:
+            return None
+    return None
 
 
 # ------------------------------------------------------- boards base / home
-def default_base_dir():
-    """Where the boards live: ~/Documents/OkibaBoards."""
+def old_base_dir():
+    """Legacy (v3 and earlier) boards location: ~/Documents/OkibaBoards."""
     docs = os.path.join(os.path.expanduser("~"), "Documents")
     return os.path.join(docs, BASE_DIR_NAME)
+
+
+def default_base_dir():
+    """Where the boards live now: <SystemDrive>\\OkibaBoards.
+
+    The OKIBA_BASE environment variable overrides everything (used by
+    tests/CI so they never touch the real disk root or Documents).
+    Off Windows (development only) falls back to ~/OkibaBoards.
+    """
+    override = os.environ.get(BASE_ENV_VAR)
+    if override:
+        return override
+    if sys.platform == "win32":
+        drive = os.environ.get("SystemDrive") or "C:"
+        return os.path.join(drive + os.sep, BASE_DIR_NAME)
+    return os.path.join(os.path.expanduser("~"), BASE_DIR_NAME)
+
+
+def migrate_base(old_base, new_base):
+    """Return the effective boards base, migrating *old_base* if needed.
+
+    If *new_base* already exists it wins as-is. Otherwise, when the old
+    base exists and holds boards, it is moved (shutil.move) to the new
+    location. If the move fails, the OLD base is returned so nothing
+    is ever lost.
+    """
+    if os.path.abspath(old_base) == os.path.abspath(new_base):
+        return new_base
+    if os.path.isdir(new_base):
+        return new_base
+    if os.path.isdir(old_base) and list_boards(old_base):
+        try:
+            shutil.move(old_base, new_base)
+            return new_base
+        except Exception:
+            return old_base
+    return new_base
+
+
+def resolve_base():
+    """Effective base for the app: migrate old -> new, then use it."""
+    return migrate_base(old_base_dir(), default_base_dir())
 
 
 def list_boards(base):
@@ -70,20 +238,34 @@ def list_boards(base):
 _INVALID_CHARS = '\\/:*?"<>|'
 
 
-def sanitize_board_name(name):
-    """Make *name* safe as a Windows folder name ('' if nothing left)."""
+def validate_board_name(name):
+    """Return the trimmed board *name*, or raise ValueError.
+
+    Nothing is silently rewritten: a name containing characters that
+    cannot be used in a Windows folder name (\\ / : * ? " < > |) or
+    ending with a dot is rejected with a message naming the problem,
+    so the user can fix the name themselves.
+    """
     cleaned = (name or "").strip()
-    cleaned = "".join("_" if ch in _INVALID_CHARS else ch
-                      for ch in cleaned)
-    cleaned = cleaned.strip().strip(".")
+    if not cleaned:
+        raise ValueError("ボード名が空です")
+    bad = sorted({ch for ch in cleaned if ch in _INVALID_CHARS})
+    if bad:
+        raise ValueError(
+            "名前に使えない文字が含まれています: %s\n"
+            "フォルダ名には \\ / : * ? \" < > | は使えません"
+            % " ".join(bad))
+    if cleaned.endswith("."):
+        raise ValueError("ボード名の最後に「.」は使えません")
     return cleaned
 
 
 def create_board(base, name):
-    """Create a new board folder under *base*; return its final name."""
-    cleaned = sanitize_board_name(name)
-    if not cleaned:
-        raise ValueError("ボード名が空です")
+    """Create a new board folder under *base*; return its final name.
+
+    The board name IS the real folder name on disk.
+    """
+    cleaned = validate_board_name(name)
     dest = os.path.join(base, cleaned)
     if os.path.exists(dest):
         raise ValueError("同じ名前のボードがあります")
@@ -93,9 +275,7 @@ def create_board(base, name):
 
 def rename_board(base, old, new):
     """Rename board folder *old* to *new* under *base*; return new name."""
-    cleaned = sanitize_board_name(new)
-    if not cleaned:
-        raise ValueError("ボード名が空です")
+    cleaned = validate_board_name(new)
     if cleaned == old:
         return cleaned
     src = os.path.join(base, old)
@@ -111,7 +291,7 @@ def rename_board(base, old, new):
 def ensure_base(base=None):
     """Create the base folder; make one default board if there are none."""
     if base is None:
-        base = default_base_dir()
+        base = resolve_base()
     os.makedirs(base, exist_ok=True)
     if not list_boards(base):
         os.makedirs(os.path.join(base, DEFAULT_BOARD_NAME), exist_ok=True)
@@ -123,23 +303,29 @@ def home_path(base):
 
 
 def load_home(base):
-    """Load home icon layout; empty defaults if none/corrupt."""
+    """Load home icon cells; returns {"positions": {name: (col, row)}}."""
     path = home_path(base)
-    if not os.path.exists(path):
-        return {"positions": {}}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return {"positions": {}}
-    data.setdefault("positions", {})
-    return data
+    positions = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for name, value in data.get("positions", {}).items():
+                cell = _cell_from_any(value, HOME_CELL_W, HOME_CELL_H)
+                if cell is not None:
+                    positions[name] = cell
+        except Exception:
+            positions = {}
+    return {"positions": positions}
 
 
 def save_home(base, positions):
-    """Save home icon positions (dict name -> {x, y}) under *base*."""
+    """Save home icon cells (dict name -> (col, row)) under *base*."""
+    data = {"positions": {
+        name: {"col": int(cell[0]), "row": int(cell[1])}
+        for name, cell in positions.items()}}
     with open(home_path(base), "w", encoding="utf-8") as f:
-        json.dump({"positions": positions}, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 # ---------------------------------------------------------------- core logic
@@ -161,24 +347,66 @@ def board_path(folder):
     return os.path.join(folder, BOARD_FILENAME)
 
 
-def save_board(folder, positions, notes):
-    """Save card positions (dict name-> {x, y}) and notes (list) to *folder*."""
-    data = {"version": 3, "positions": positions, "notes": notes}
+def save_board(folder, positions, notes, size=DEFAULT_SIZE):
+    """Save card cells, notes and card *size* into *folder*'s board file.
+
+    positions: dict name -> (col, row). notes: list of dicts with
+    id/text/col/row.
+    """
+    if size not in BOARD_SIZES:
+        size = DEFAULT_SIZE
+    data = {
+        "version": 4,
+        "size": size,
+        "positions": {
+            name: {"col": int(cell[0]), "row": int(cell[1])}
+            for name, cell in positions.items()},
+        "notes": [
+            {"id": n["id"], "text": n["text"],
+             "col": int(n["col"]), "row": int(n["row"])}
+            for n in notes],
+    }
     with open(board_path(folder), "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return data
 
 
 def load_board(folder):
-    """Load saved positions/notes from *folder*; empty defaults if none."""
+    """Load a board file, normalized to v4 cells.
+
+    Returns {"positions": {name: (col, row)}, "notes": [...],
+    "size": "小"/"中"/"大"}. Legacy v3 pixel positions are converted
+    to cells with the 中 cell size.
+    """
+    result = {"version": 4, "positions": {}, "notes": [],
+              "size": DEFAULT_SIZE}
     path = board_path(folder)
     if not os.path.exists(path):
-        return {"version": 3, "positions": {}, "notes": []}
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    data.setdefault("positions", {})
-    data.setdefault("notes", [])
-    return data
+        return result
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return result
+    if data.get("size") in BOARD_SIZES:
+        result["size"] = data["size"]
+    metrics = BOARD_SIZES[result["size"]]
+    for name, value in data.get("positions", {}).items():
+        cell = _cell_from_any(value, metrics["cell_w"], metrics["cell_h"])
+        if cell is not None:
+            result["positions"][name] = cell
+    for n in data.get("notes", []):
+        try:
+            cell = _cell_from_any(n, metrics["cell_w"], metrics["cell_h"])
+            if cell is None:
+                continue
+            result["notes"].append({
+                "id": n.get("id") or uuid.uuid4().hex[:10],
+                "text": n.get("text", ""),
+                "col": cell[0], "row": cell[1]})
+        except Exception:
+            continue
+    return result
 
 
 def _drive_of(path):
@@ -245,6 +473,26 @@ def open_item(path):
         subprocess.Popen([opener, path])
 
 
+def reveal_in_explorer(path):
+    """Show *path* in Explorer: file -> selected, folder -> opened.
+
+    Windows only; returns True when the command was launched.
+    """
+    if sys.platform != "win32" or not path or not os.path.exists(path):
+        return False
+    try:
+        import subprocess
+
+        if os.path.isdir(path):
+            subprocess.Popen(["explorer.exe", os.path.abspath(path)])
+        else:
+            subprocess.Popen('explorer.exe /select,"%s"'
+                             % os.path.abspath(path))
+        return True
+    except Exception:
+        return False
+
+
 def recycle_bin_delete(paths):
     """Move *paths* to the Windows Recycle Bin. True on success.
 
@@ -285,45 +533,143 @@ def recycle_bin_delete(paths):
 
 # ------------------------------------------------------------------ self-test
 def run_self_test():
-    """Exercise base/home handling + scanning + save/load + intake."""
+    """Exercise base/migration, grid math, boards, save/load, intake."""
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            # ---------- boards base & home layout ----------
-            base = os.path.join(tmp, "OkibaBoards")
-            ensure_base(base)
-            assert list_boards(base) == [DEFAULT_BOARD_NAME], list_boards(base)
+            # ---------- base resolution + migration ----------
+            old_base = os.path.join(tmp, "Documents", "OkibaBoards")
+            os.makedirs(os.path.join(old_base, "昔のボード"))
+            new_base = os.path.join(tmp, "C", "OkibaBoards")
 
-            created = create_board(base, "資料")
-            assert created == "資料"
-            assert sorted(list_boards(base)) == sorted(
-                [DEFAULT_BOARD_NAME, "資料"])
-
+            # env override wins for default_base_dir()
+            os.environ[BASE_ENV_VAR] = new_base
             try:
-                create_board(base, "資料")
+                assert default_base_dir() == new_base
+            finally:
+                del os.environ[BASE_ENV_VAR]
+
+            # new missing + old has boards -> moved to new
+            eff = migrate_base(old_base, new_base)
+            assert eff == new_base, eff
+            assert not os.path.exists(old_base)
+            assert list_boards(new_base) == ["昔のボード"]
+
+            # new exists -> new wins, old left untouched
+            old2 = os.path.join(tmp, "old2")
+            os.makedirs(os.path.join(old2, "残るボード"))
+            eff2 = migrate_base(old2, new_base)
+            assert eff2 == new_base
+            assert list_boards(old2) == ["残るボード"]
+
+            # move failure -> fall back to old, nothing lost
+            blocker = os.path.join(tmp, "blocker")
+            with open(blocker, "w", encoding="utf-8") as f:
+                f.write("not a folder")
+            bad_new = os.path.join(blocker, "OkibaBoards")
+            old3 = os.path.join(tmp, "old3")
+            os.makedirs(os.path.join(old3, "大事なボード"))
+            eff3 = migrate_base(old3, bad_new)
+            assert eff3 == old3, eff3
+            assert list_boards(old3) == ["大事なボード"]
+
+            # ---------- boards base & home layout ----------
+            base = os.path.join(tmp, "boards")
+            ensure_base(base)
+            assert list_boards(base) == [DEFAULT_BOARD_NAME]
+
+            # free choice of board name (name = real folder name)
+            created = create_board(base, "私の作業ボード")
+            assert created == "私の作業ボード"
+            assert os.path.isdir(os.path.join(base, "私の作業ボード"))
+            try:
+                create_board(base, "私の作業ボード")
                 raise AssertionError("duplicate board must raise")
             except ValueError:
                 pass
-
-            cleaned = create_board(base, "a/b:c")
-            assert cleaned == "a_b_c", cleaned
-
-            renamed = rename_board(base, "資料", "素材 置き場")
-            assert renamed == "素材 置き場"
-            assert "素材 置き場" in list_boards(base)
-
+            # unusable characters must NOT be silently replaced:
+            # creation is refused and nothing is made
+            for bad_name in ["a/b", "a:b", "a*b?", 'a"b', "a<b>|"]:
+                try:
+                    create_board(base, bad_name)
+                    raise AssertionError("bad name must raise: %r"
+                                         % bad_name)
+                except ValueError as exc:
+                    assert "使えない文字" in str(exc), str(exc)
+                assert not os.path.exists(os.path.join(base, bad_name))
             try:
-                rename_board(base, "素材 置き場", "a_b_c")
+                create_board(base, "   ")
+                raise AssertionError("empty name must raise")
+            except ValueError:
+                pass
+            other = create_board(base, "作業メモ")
+            assert other == "作業メモ"
+            # rename to any free name works and renames the real folder
+            renamed = rename_board(base, "私の作業ボード", "素材 置き場")
+            assert renamed == "素材 置き場"
+            assert os.path.isdir(os.path.join(base, "素材 置き場"))
+            assert not os.path.exists(os.path.join(base, "私の作業ボード"))
+            try:
+                rename_board(base, "素材 置き場", "作業メモ")
                 raise AssertionError("rename onto existing must raise")
             except ValueError:
                 pass
+            # rename with unusable characters is refused, name unchanged
+            try:
+                rename_board(base, "素材 置き場", "だめ/名前")
+                raise AssertionError("bad rename must raise")
+            except ValueError as exc:
+                assert "使えない文字" in str(exc), str(exc)
+            assert os.path.isdir(os.path.join(base, "素材 置き場"))
 
-            save_home(base, {DEFAULT_BOARD_NAME: {"x": 12, "y": 34}})
+            save_home(base, {DEFAULT_BOARD_NAME: (2, 1)})
             home = load_home(base)
-            assert home["positions"][DEFAULT_BOARD_NAME] == {"x": 12, "y": 34}
-            # the home layout file is a file, never a board
+            assert home["positions"][DEFAULT_BOARD_NAME] == (2, 1)
             assert HOME_FILENAME not in list_boards(base)
 
-            # ---------- board data (scan + save/load) ----------
+            # ---------- grid math ----------
+            m = BOARD_SIZES["中"]
+            # cell -> pos -> cell roundtrip
+            for cell in [(0, 0), (1, 0), (0, 3), (4, 2)]:
+                x, y = cell_to_pos(cell[0], cell[1],
+                                   m["cell_w"], m["cell_h"])
+                assert pos_to_cell(x, y, m["cell_w"], m["cell_h"]) == cell
+            # a pixel near a cell corner snaps back to that cell
+            x, y = cell_to_pos(2, 1, m["cell_w"], m["cell_h"])
+            assert pos_to_cell(x + 40, y + 30,
+                               m["cell_w"], m["cell_h"]) == (2, 1)
+            # a pixel past the half-way point snaps to the next cell
+            assert pos_to_cell(x + m["cell_w"] - 10, y,
+                               m["cell_w"], m["cell_h"]) == (3, 1)
+            # never negative
+            assert pos_to_cell(-50, -50, m["cell_w"], m["cell_h"]) == (0, 0)
+
+            # vertical-column auto-fill: columns fill top-to-bottom
+            rpc = 3
+            occ = set()
+            order = []
+            for _ in range(5):
+                c = next_free_cell(occ, rpc)
+                order.append(c)
+                occ.add(c)
+            assert order == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1)], order
+            # starting the search at a given cell
+            assert next_free_cell({(0, 0)}, rpc, start=(0, 1)) == (0, 1)
+            assert next_free_cell({(0, 0), (0, 1)}, rpc,
+                                  start=(0, 1)) == (0, 2)
+
+            # swap at the data level
+            cells = {"a.txt": (0, 0), "b.txt": (0, 1), "c.txt": (1, 0)}
+            swapped = move_to_cell(cells, "a.txt", (0, 1))
+            assert swapped == "b.txt"
+            assert cells["a.txt"] == (0, 1) and cells["b.txt"] == (0, 0)
+            assert cells["c.txt"] == (1, 0)
+            # moving onto a free cell swaps nothing
+            assert move_to_cell(cells, "c.txt", (3, 2)) is None
+            assert cells["c.txt"] == (3, 2)
+            # moving onto its own cell is a no-op
+            assert move_to_cell(cells, "c.txt", (3, 2)) is None
+
+            # ---------- board data (scan + save/load + size) ----------
             board = os.path.join(base, DEFAULT_BOARD_NAME)
             with open(os.path.join(board, "alpha.txt"), "w",
                       encoding="utf-8") as f:
@@ -338,19 +684,36 @@ def run_self_test():
             assert names == ["alpha.txt", "beta.txt", "subfolder"], names
             assert entries[2]["is_dir"] is True
 
-            positions = {"alpha.txt": {"x": 137, "y": 259}}
-            notes = [{"id": "test1", "text": "sample note", "x": 55, "y": 66}]
-            save_board(board, positions, notes)
-
+            positions = {"alpha.txt": (2, 1)}
+            notes = [{"id": "test1", "text": "sample note",
+                      "col": 0, "row": 2}]
+            save_board(board, positions, notes, size="大")
             names_after = [e["name"] for e in scan_folder(board)]
             assert BOARD_FILENAME not in names_after, names_after
 
             loaded = load_board(board)
-            # saved positions must come back EXACTLY (free placement)
-            assert loaded["positions"]["alpha.txt"] == {"x": 137, "y": 259}
+            assert loaded["size"] == "大", loaded["size"]
+            assert loaded["positions"]["alpha.txt"] == (2, 1)
             assert loaded["notes"][0]["text"] == "sample note"
-            assert loaded["notes"][0]["x"] == 55
-            assert loaded["notes"][0]["y"] == 66
+            assert (loaded["notes"][0]["col"],
+                    loaded["notes"][0]["row"]) == (0, 2)
+
+            # default size when the json has none
+            save_board(board, {}, [])
+            assert load_board(board)["size"] == "中"
+
+            # legacy v3 pixel positions convert to 中 cells
+            legacy = {"version": 3,
+                      "positions": {"alpha.txt": {"x": 350, "y": 120}},
+                      "notes": [{"id": "n1", "text": "old", "x": 24,
+                                 "y": 24}]}
+            with open(board_path(board), "w", encoding="utf-8") as f:
+                json.dump(legacy, f, ensure_ascii=False)
+            conv = load_board(board)
+            assert conv["positions"]["alpha.txt"] == (2, 1), \
+                conv["positions"]
+            assert (conv["notes"][0]["col"],
+                    conv["notes"][0]["row"]) == (0, 0)
 
             # ---------- intake helper (drop / ＋ファイル shared) ----------
             src_dir = os.path.join(tmp, "incoming")
@@ -388,11 +751,13 @@ def run_self_test():
             assert len(placed3) == 1, placed3
             assert os.path.isdir(placed3[0])
 
-            # recycle helper must refuse safely off Windows (never deletes)
+            # recycle / reveal helpers must refuse safely off Windows
             if sys.platform != "win32":
                 assert recycle_bin_delete(
                     [os.path.join(board_dir, "dropped.txt")]) is False
                 assert os.path.exists(os.path.join(board_dir, "dropped.txt"))
+                assert reveal_in_explorer(
+                    os.path.join(board_dir, "dropped.txt")) is False
 
         with open(SELF_TEST_OK, "w", encoding="utf-8") as f:
             f.write("ok\n")
@@ -404,8 +769,6 @@ def run_self_test():
         except Exception:
             pass
         return 1
-
-
 # --------------------------------------- Windows native drag & drop (WM_DROPFILES)
 class NativeDrop:
     """Explorer file drops via shell32 DragAcceptFiles + WM_DROPFILES.
@@ -516,6 +879,8 @@ class NativeDrop:
             self.callback(paths, int(pt.x), int(pt.y), hwnd)
 
 
+
+
 # ------------------------------------------------------------------------ GUI
 BG_TOP = (5, 8, 20)       # deep navy-black
 BG_BOTTOM = (13, 21, 48)  # dark navy
@@ -547,9 +912,6 @@ def run_gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, simpledialog
 
-    CARD_W, CARD_H = 150, 88      # board file/note cards
-    ICON_W, ICON_H = 136, 108     # home board icons
-
     class App:
         def __init__(self, root):
             self.root = root
@@ -560,21 +922,27 @@ def run_gui():
             self.base = ensure_base()
             self.view = "home"
 
-            # ---- home state ----
+            # ---- home state: positions = {board name: (col, row)} ----
             self.home_positions = load_home(self.base).get("positions", {})
             self.home_items = {}   # canvas tag -> board name
-            self.home_drag = {"tag": None, "dx": 0, "dy": 0}
+            self.home_drag = {"tag": None, "dx": 0, "dy": 0,
+                              "x": 0, "y": 0}
+            self.home_rpc = rows_per_column(640, HOME_CELL_H)
 
             # ---- board state ----
             self.board_folder = None
             self.board_name = ""
-            self.positions = {}
-            self.notes = []
-            self.items = {}        # canvas tag -> info dict
+            self.board_size = DEFAULT_SIZE
+            self.positions = {}    # file/folder name -> (col, row)
+            self.notes = []        # {id, text, col, row}
+            self.items = {}        # canvas tag -> info dict (has x, y px)
             self.known_names = set()
             self.drag = {"tag": None, "dx": 0, "dy": 0}
+            self.board_rpc = rows_per_column(640,
+                                             BOARD_SIZES[DEFAULT_SIZE]
+                                             ["cell_h"])
 
-            # ---- native drop (set up after widgets exist) ----
+            # ---- native drop ----
             self.drop = NativeDrop(self.on_native_drop)
             self.drop_setup_done = False
 
@@ -585,10 +953,12 @@ def run_gui():
             self.root.after(60, self.setup_drop)
             self.root.after(POLL_MS, self.poll_folder)
 
-        # ------------------------------------------------------------ layout
-        def _make_button(self, parent, text, command):
-            import tkinter as tk
+        # ------------------------------------------------------------ helpers
+        @property
+        def metrics(self):
+            return BOARD_SIZES[self.board_size]
 
+        def _make_button(self, parent, text, command):
             btn = tk.Button(
                 parent, text=text, command=command,
                 bg="#22315e", fg="white", activebackground="#2e4176",
@@ -597,27 +967,30 @@ def run_gui():
             return btn
 
         def _build_home(self):
-            import tkinter as tk
-
             frame = tk.Frame(self.root, bg="#070b18")
             self.home_frame = frame
             bar = tk.Frame(frame, bg="#0d1430")
             bar.pack(side="top", fill="x")
             self._make_button(bar, "＋ボード", self.add_board)
             tk.Label(
-                bar, text="ボードをダブルクリックで開きます。"
-                          "アイコンは好きな場所へドラッグできます",
+                bar, text="ボードをダブルクリックで開きます",
                 bg="#0d1430", fg="#aebadd",
             ).pack(side="left", padx=12)
+            tk.Label(
+                bar, text="保存場所: %s" % self.base,
+                bg="#0d1430", fg="#7e8bb5",
+                font=("Yu Gothic UI", 9),
+            ).pack(side="right", padx=12)
             self.home_canvas = tk.Canvas(frame, bg="#070b18",
                                          highlightthickness=0)
             self.home_canvas.pack(side="top", fill="both", expand=True)
-            self.home_canvas.bind(
-                "<Configure>", lambda e: draw_gradient(self.home_canvas))
+            self.home_canvas.bind("<Configure>", self._home_configure)
+
+        def _home_configure(self, event):
+            draw_gradient(self.home_canvas)
+            self.home_rpc = rows_per_column(event.height, HOME_CELL_H)
 
         def _build_board(self):
-            import tkinter as tk
-
             frame = tk.Frame(self.root, bg="#070b18")
             self.board_frame = frame
             bar = tk.Frame(frame, bg="#0d1430")
@@ -625,14 +998,20 @@ def run_gui():
             self._make_button(bar, "← もどる", self.show_home)
             self._make_button(bar, "＋メモ", self.add_note)
             self._make_button(bar, "＋ファイル", self.add_files)
+            self.size_button = self._make_button(
+                bar, "大きさ: %s" % self.board_size, self.cycle_size)
             self.board_label = tk.Label(bar, text="", bg="#0d1430",
                                         fg="#aebadd")
             self.board_label.pack(side="left", padx=12)
             self.canvas = tk.Canvas(frame, bg="#070b18",
                                     highlightthickness=0)
             self.canvas.pack(side="top", fill="both", expand=True)
-            self.canvas.bind(
-                "<Configure>", lambda e: draw_gradient(self.canvas))
+            self.canvas.bind("<Configure>", self._board_configure)
+
+        def _board_configure(self, event):
+            draw_gradient(self.canvas)
+            self.board_rpc = rows_per_column(event.height,
+                                             self.metrics["cell_h"])
 
         def show_home(self):
             self.save_board_data()
@@ -653,18 +1032,22 @@ def run_gui():
         def save_board_data(self):
             if self.board_folder:
                 try:
-                    save_board(self.board_folder, self.positions, self.notes)
+                    save_board(self.board_folder, self.positions,
+                               self.notes, size=self.board_size)
                 except Exception:
                     pass
 
+        def cycle_size(self):
+            idx = SIZE_ORDER.index(self.board_size)
+            self.board_size = SIZE_ORDER[(idx + 1) % len(SIZE_ORDER)]
+            self.size_button.config(text="大きさ: %s" % self.board_size)
+            self.board_rpc = rows_per_column(
+                max(self.canvas.winfo_height(), 640),
+                self.metrics["cell_h"])
+            self.render_board()
+
         # -------------------------------------------------------- drop setup
         def setup_drop(self):
-            """Subclass root + board canvas for WM_DROPFILES (Windows).
-
-            The board surface is a single Canvas whose items are drawn
-            canvas items (no child widgets), so the canvas hwnd is the
-            one drop target. Home drops are not needed and are ignored.
-            """
             if self.drop_setup_done:
                 return
             try:
@@ -676,8 +1059,6 @@ def run_gui():
                 self.drop.install(self.canvas.winfo_id())
             except Exception:
                 pass
-            # only stop retrying once registration really succeeded
-            # (or there is nothing to register on this platform)
             if self.drop.active or sys.platform != "win32":
                 self.drop_setup_done = True
 
@@ -686,32 +1067,38 @@ def run_gui():
                 return  # drops on the home screen are ignored
             if getattr(self, "root_hwnd", None) is not None \
                     and hwnd == self.root_hwnd:
-                # root client coords -> canvas coords
                 x -= self.canvas.winfo_x()
                 y -= self.canvas.winfo_y()
-            x = max(int(x), 8)
-            y = max(int(y), 8)
-            self.intake_files(paths, x, y)
+            self.intake_files(paths, drop_xy=(max(int(x), 0),
+                                              max(int(y), 0)))
 
-        def intake_files(self, paths, x=None, y=None):
+        def intake_files(self, paths, drop_xy=None):
             """Shared intake for native drop and the ＋ファイル button."""
             if not self.board_folder:
                 return
             try:
                 placed = place_dropped_items(list(paths), self.board_folder)
             except Exception as exc:
-                self.board_label.config(text="追加できませんでした: %s" % exc)
+                self.update_board_hint("追加できませんでした: %s" % exc)
                 return
-            if placed:
-                if x is None or y is None:
-                    x, y = self.free_position()
-                for i, p in enumerate(placed):
-                    self.positions[os.path.basename(p)] = {
-                        "x": x + i * 22, "y": y + i * 22}
-                self.render_board()
-                self.update_board_hint("%d 件を追加しました" % len(placed))
-            else:
+            if not placed:
                 self.update_board_hint("追加できるものがありませんでした")
+                return
+            m = self.metrics
+            if drop_xy is not None:
+                start = pos_to_cell(drop_xy[0], drop_xy[1],
+                                    m["cell_w"], m["cell_h"])
+            else:
+                start = None
+            occupied = self._occupied_cells()
+            for p in placed:
+                cell = next_free_cell(occupied, self.board_rpc,
+                                      start=start)
+                self.positions[os.path.basename(p)] = cell
+                occupied.add(cell)
+                start = cell
+            self.render_board()
+            self.update_board_hint("%d 件を追加しました" % len(placed))
 
         def add_files(self):
             paths = filedialog.askopenfilenames(
@@ -731,6 +1118,29 @@ def run_gui():
                 text += "：" + hint
             self.board_label.config(text=text)
 
+        # ------------------------------------------------------- grid helpers
+        def _occupied_cells(self):
+            occ = set(self.positions.values())
+            occ |= {(n["col"], n["row"]) for n in self.notes}
+            return occ
+
+        def _combined_cells(self):
+            cells = {}
+            for name, cell in self.positions.items():
+                cells[("file", name)] = tuple(cell)
+            for n in self.notes:
+                cells[("note", n["id"])] = (n["col"], n["row"])
+            return cells
+
+        def _apply_cells(self, cells):
+            for (kind, key), cell in cells.items():
+                if kind == "file":
+                    self.positions[key] = tuple(cell)
+                else:
+                    for n in self.notes:
+                        if n["id"] == key:
+                            n["col"], n["row"] = int(cell[0]), int(cell[1])
+
         # ------------------------------------------------------------ home
         def render_home(self):
             c = self.home_canvas
@@ -738,43 +1148,34 @@ def run_gui():
                 c.delete(tag)
             self.home_items = {}
             boards = list_boards(self.base)
-            # forget positions of boards that no longer exist
             for gone in [n for n in self.home_positions if n not in boards]:
                 del self.home_positions[gone]
+            occupied = set(self.home_positions.values())
             for name in boards:
-                pos = self.home_positions.get(name)
-                if pos:
-                    x, y = pos["x"], pos["y"]  # saved place: EXACT
-                else:
-                    x, y = self.home_free_position()
-                    self.home_positions[name] = {"x": x, "y": y}
+                cell = self.home_positions.get(name)
+                if cell is None:
+                    cell = next_free_cell(occupied, self.home_rpc)
+                    self.home_positions[name] = cell
+                    occupied.add(cell)
+                x, y = cell_to_pos(cell[0], cell[1],
+                                   HOME_CELL_W, HOME_CELL_H)
                 self.make_board_icon(name, x, y)
             save_home(self.base, self.home_positions)
-
-        def home_free_position(self):
-            used = {(p["x"], p["y"]) for p in self.home_positions.values()}
-            idx = 0
-            while True:
-                x = 24 + (idx % 6) * (ICON_W + 20)
-                y = 24 + (idx // 6) * (ICON_H + 20)
-                if (x, y) not in used:
-                    return x, y
-                idx += 1
 
         def make_board_icon(self, name, x, y):
             c = self.home_canvas
             tag = "board_" + uuid.uuid4().hex[:10]
-            c.create_rectangle(x, y, x + ICON_W, y + ICON_H,
+            c.create_rectangle(x, y, x + HOME_ICON_W, y + HOME_ICON_H,
                                fill="#1a2447", outline="#46589a", width=2,
                                tags=(tag, "bicon"))
-            c.create_text(x + ICON_W // 2, y + 30, text="📁",
+            c.create_text(x + HOME_ICON_W // 2, y + 30, text="📁",
                           font=("Segoe UI Emoji", 26), fill="#eef1ff",
                           tags=(tag, "bicon"))
             label = name if len(name) <= 16 else name[:15] + "…"
-            c.create_text(x + ICON_W // 2, y + ICON_H - 26, text=label,
-                          font=("Yu Gothic UI", 11), fill="#eef1ff",
-                          width=ICON_W - 12, justify="center",
-                          tags=(tag, "bicon"))
+            c.create_text(x + HOME_ICON_W // 2, y + HOME_ICON_H - 26,
+                          text=label, font=("Yu Gothic UI", 11),
+                          fill="#eef1ff", width=HOME_ICON_W - 12,
+                          justify="center", tags=(tag, "bicon"))
             self.home_items[tag] = name
             c.tag_bind(tag, "<ButtonPress-1>", self.home_press)
             c.tag_bind(tag, "<B1-Motion>", self.home_move)
@@ -793,25 +1194,36 @@ def run_gui():
             if not tag:
                 return
             name = self.home_items[tag]
-            pos = self.home_positions[name]
-            self.home_drag = {"tag": tag, "dx": event.x - pos["x"],
-                              "dy": event.y - pos["y"]}
+            cell = self.home_positions[name]
+            x, y = cell_to_pos(cell[0], cell[1], HOME_CELL_W, HOME_CELL_H)
+            self.home_drag = {"tag": tag, "dx": event.x - x,
+                              "dy": event.y - y, "x": x, "y": y}
             self.home_canvas.tag_raise(tag)
 
         def home_move(self, event):
             tag = self.home_drag.get("tag")
             if not tag:
                 return
-            name = self.home_items[tag]
-            pos = self.home_positions[name]
-            nx, ny = event.x - self.home_drag["dx"], event.y - self.home_drag["dy"]
-            self.home_canvas.move(tag, nx - pos["x"], ny - pos["y"])
-            self.home_positions[name] = {"x": nx, "y": ny}
+            nx = event.x - self.home_drag["dx"]
+            ny = event.y - self.home_drag["dy"]
+            self.home_canvas.move(tag, nx - self.home_drag["x"],
+                                  ny - self.home_drag["y"])
+            self.home_drag["x"], self.home_drag["y"] = nx, ny
 
         def home_release(self, event):
-            if self.home_drag.get("tag"):
-                save_home(self.base, self.home_positions)
-            self.home_drag = {"tag": None, "dx": 0, "dy": 0}
+            tag = self.home_drag.get("tag")
+            if not tag:
+                return
+            name = self.home_items[tag]
+            target = pos_to_cell(self.home_drag["x"], self.home_drag["y"],
+                                 HOME_CELL_W, HOME_CELL_H)
+            cells = {n: tuple(c) for n, c in self.home_positions.items()}
+            move_to_cell(cells, name, target)
+            self.home_positions = cells
+            self.home_drag = {"tag": None, "dx": 0, "dy": 0,
+                              "x": 0, "y": 0}
+            save_home(self.base, self.home_positions)
+            self.render_home()
 
         def home_double(self, event):
             tag = self.home_tag()
@@ -819,13 +1231,16 @@ def run_gui():
                 self.open_board(self.home_items[tag])
 
         def home_right(self, event):
-            import tkinter as tk
-
             tag = self.home_tag()
             if not tag:
                 return
             name = self.home_items[tag]
+            path = os.path.join(self.base, name)
             menu = tk.Menu(self.root, tearoff=0)
+            menu.add_command(label="開く",
+                             command=lambda: self.open_board(name))
+            menu.add_command(label="場所を開く",
+                             command=lambda: reveal_in_explorer(path))
             menu.add_command(label="名前変更",
                              command=lambda: self.rename_board_ui(name))
             menu.add_command(label="ゴミ箱へ削除",
@@ -840,19 +1255,24 @@ def run_gui():
             n = len(boards) + 1
             while ("ボード%d" % n) in boards:
                 n += 1
+            # Always ask: the user freely chooses the board's name.
+            # The suggested "ボードN" is just an editable draft.
             name = simpledialog.askstring(
-                "ボードを作る", "ボードの名前:",
+                "ボードを作る", "ボードの名前を決めてください:",
                 initialvalue="ボード%d" % n, parent=self.root)
             if name is None:
-                return
+                return  # cancelled -> create nothing
             try:
                 created = create_board(self.base, name)
             except ValueError as exc:
+                # covers empty names and unusable characters; the
+                # message says exactly what is wrong, nothing is made
                 messagebox.showerror("ボードを作れません", str(exc),
                                      parent=self.root)
                 return
-            fx, fy = self.home_free_position()
-            self.home_positions[created] = {"x": fx, "y": fy}
+            cell = next_free_cell(set(self.home_positions.values()),
+                                  self.home_rpc)
+            self.home_positions[created] = cell
             self.render_home()
 
         def rename_board_ui(self, old):
@@ -891,19 +1311,24 @@ def run_gui():
         # ------------------------------------------------------------ board
         def open_board(self, name):
             self.setup_drop()
+            self.save_board_data()
             self.board_name = name
             self.board_folder = os.path.join(self.base, name)
             data = load_board(self.board_folder)
-            self.positions = data.get("positions", {})
+            self.positions = {k: tuple(v)
+                              for k, v in data.get("positions", {}).items()}
             self.notes = data.get("notes", [])
+            self.board_size = data.get("size", DEFAULT_SIZE)
+            self.size_button.config(text="大きさ: %s" % self.board_size)
+            self.board_rpc = rows_per_column(
+                max(self.canvas.winfo_height(), 640),
+                self.metrics["cell_h"])
             self.view = "board"
             self.home_frame.pack_forget()
             self.board_frame.pack(side="top", fill="both", expand=True)
             self.root.title("OkibaBoard - " + name)
             self.render_board()
             self.update_board_hint()
-            # retry once the board widgets are really on screen, then
-            # refresh the hint so it always tells the truth
             self.root.after(120, self.setup_drop)
             self.root.after(200, self.update_board_hint)
 
@@ -911,29 +1336,16 @@ def run_gui():
             try:
                 if self.view == "board" and self.board_folder \
                         and not self.drag.get("tag"):
-                    names = {e["name"] for e in scan_folder(self.board_folder)}
+                    names = {e["name"]
+                             for e in scan_folder(self.board_folder)}
                     if names != self.known_names:
                         for gone in self.known_names - names:
                             self.positions.pop(gone, None)
-                        # saved positions of remaining cards are kept
-                        # EXACTLY as-is; only new cards get a free slot
-                        # inside render_board().
                         self.render_board()
             except Exception:
                 pass
             finally:
                 self.root.after(POLL_MS, self.poll_folder)
-
-        def free_position(self):
-            used = {(p["x"], p["y"]) for p in self.positions.values()}
-            used |= {(n["x"], n["y"]) for n in self.notes}
-            idx = 0
-            while True:
-                x = 24 + (idx % 6) * (CARD_W + 18)
-                y = 24 + (idx // 6) * (CARD_H + 18)
-                if (x, y) not in used:
-                    return x, y
-                idx += 1
 
         def render_board(self):
             c = self.canvas
@@ -942,37 +1354,48 @@ def run_gui():
             self.items = {}
             if not self.board_folder:
                 return
+            m = self.metrics
             entries = scan_folder(self.board_folder)
             self.known_names = {e["name"] for e in entries}
+            # notes + already-placed files occupy their cells, so a
+            # brand-new card never overlaps them
+            occupied = self._occupied_cells()
             for e in entries:
-                pos = self.positions.get(e["name"])
-                if pos:
-                    x, y = pos["x"], pos["y"]  # saved place: EXACT
-                else:
-                    x, y = self.free_position()
-                    self.positions[e["name"]] = {"x": x, "y": y}
+                cell = self.positions.get(e["name"])
+                if cell is None:
+                    cell = next_free_cell(occupied, self.board_rpc)
+                    self.positions[e["name"]] = cell
+                occupied.add(tuple(cell))
+                x, y = cell_to_pos(cell[0], cell[1],
+                                   m["cell_w"], m["cell_h"])
                 self.make_card(
                     kind="dir" if e["is_dir"] else "file",
                     name=e["name"], x=x, y=y,
                     icon="📁" if e["is_dir"] else "📄")
             for n in self.notes:
-                self.make_card(kind="note", name=n["text"], x=n["x"], y=n["y"],
+                x, y = cell_to_pos(n["col"], n["row"],
+                                   m["cell_w"], m["cell_h"])
+                self.make_card(kind="note", name=n["text"], x=x, y=y,
                                icon="📝", note_id=n["id"])
             self.save_board_data()
 
         def make_card(self, kind, name, x, y, icon, note_id=None):
             c = self.canvas
+            m = self.metrics
             tag = "card_" + uuid.uuid4().hex[:10]
             fill = "#3a3320" if kind == "note" else "#1a2447"
             outline = "#8a7a3a" if kind == "note" else "#46589a"
-            c.create_rectangle(x, y, x + CARD_W, y + CARD_H, fill=fill,
-                               outline=outline, width=2, tags=(tag, "card"))
+            c.create_rectangle(x, y, x + m["card_w"], y + m["card_h"],
+                               fill=fill, outline=outline, width=2,
+                               tags=(tag, "card"))
             label = icon + " " + name
-            if len(label) > 34:
-                label = label[:33] + "…"
-            c.create_text(x + 10, y + 12, text=label, anchor="nw",
-                          fill="#eef1ff", width=CARD_W - 20,
-                          font=("Yu Gothic UI", 10), tags=(tag, "card"))
+            max_chars = max(10, m["card_w"] // 8)
+            if len(label) > max_chars:
+                label = label[:max_chars - 1] + "…"
+            c.create_text(x + 10, y + 10, text=label, anchor="nw",
+                          fill="#eef1ff", width=m["card_w"] - 20,
+                          font=("Yu Gothic UI", m["font"]),
+                          tags=(tag, "card"))
             self.items[tag] = {"kind": kind, "name": name,
                                "note_id": note_id, "x": x, "y": y}
             c.tag_bind(tag, "<ButtonPress-1>", self.on_press)
@@ -1010,15 +1433,18 @@ def run_gui():
             if not tag:
                 return
             info = self.items[tag]
-            if info["kind"] == "note":
-                for n in self.notes:
-                    if n["id"] == info["note_id"]:
-                        n["x"], n["y"] = info["x"], info["y"]
-            else:
-                self.positions[info["name"]] = {"x": info["x"],
-                                                "y": info["y"]}
             self.drag = {"tag": None, "dx": 0, "dy": 0}
-            self.save_board_data()
+            m = self.metrics
+            target = pos_to_cell(info["x"], info["y"],
+                                 m["cell_w"], m["cell_h"])
+            if info["kind"] == "note":
+                key = ("note", info["note_id"])
+            else:
+                key = ("file", info["name"])
+            cells = self._combined_cells()
+            move_to_cell(cells, key, target)  # swaps if occupied
+            self._apply_cells(cells)
+            self.render_board()  # re-renders snapped + saves
 
         def on_double(self, event):
             tag = self.card_tag()
@@ -1032,8 +1458,6 @@ def run_gui():
 
         # ---- right-click menu (board cards) ----
         def card_right(self, event):
-            import tkinter as tk
-
             tag = self.card_tag()
             if not tag:
                 return
@@ -1047,10 +1471,13 @@ def run_gui():
                     label="削除",
                     command=lambda: self.delete_note(info))
             else:
+                path = os.path.join(self.board_folder, info["name"])
                 menu.add_command(
                     label="開く",
-                    command=lambda: open_item(
-                        os.path.join(self.board_folder, info["name"])))
+                    command=lambda: open_item(path))
+                menu.add_command(
+                    label="場所を開く",
+                    command=lambda: reveal_in_explorer(path))
                 menu.add_command(
                     label="名前変更",
                     command=lambda: self.rename_file_ui(info))
@@ -1126,9 +1553,9 @@ def run_gui():
             text = simpledialog.askstring("メモ", "メモ:", parent=self.root)
             if not text:
                 return
-            x, y = self.free_position()
+            cell = next_free_cell(self._occupied_cells(), self.board_rpc)
             self.notes.append({"id": uuid.uuid4().hex[:10], "text": text,
-                               "x": x, "y": y})
+                               "col": cell[0], "row": cell[1]})
             self.render_board()
 
     root = tk.Tk()
