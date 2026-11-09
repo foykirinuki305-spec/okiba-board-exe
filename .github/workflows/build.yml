@@ -1,0 +1,37 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build exe
+        run: pyinstaller --onefile --windowed --name OkibaBoard OkibaBoard.py
+
+      - name: Smoke test (headless self-test)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath ".\dist\OkibaBoard.exe" -ArgumentList "--self-test" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "self-test exit code: $($p.ExitCode)" }
+          if (-not (Test-Path ".\self-test-ok.txt")) { throw "self-test-ok.txt not found" }
+          $marker = Get-Content ".\self-test-ok.txt" -Raw
+          if ($marker -notmatch "ok") { throw "self-test marker unexpected: $marker" }
+          Write-Host "Smoke test passed: $marker"
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OkibaBoard-exe
+          path: dist/OkibaBoard.exe

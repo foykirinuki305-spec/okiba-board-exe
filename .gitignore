@@ -1,0 +1,6 @@
+__pycache__/
+build/
+dist/
+*.spec
+self-test-ok.txt
+.okiba-board.json
