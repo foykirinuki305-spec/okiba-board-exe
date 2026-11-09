@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-OkibaBoard v5 - Deskboard-style board app (Python + Tkinter, stdlib only)
+OkibaBoard v6 - Deskboard-style board app (Python + Tkinter, stdlib only)
 
 Model: MULTIPLE BOARDS, like files on a home screen.
 - Launch -> HOME screen (dark, desktop-like) with board icons.
@@ -29,10 +29,13 @@ Model: MULTIPLE BOARDS, like files on a home screen.
   Right-click a file card: 開く / 場所を開く / デスクトップへ移動 /
   rename (renames the real file) / send to Recycle Bin.
   Double-click opens the real file.
-  Dragging a file/folder card OUT of the window starts a native OLE
-  drag (ole32.DoDragDrop, CF_HDROP) so it can be dropped on the
-  Desktop / Explorer with MOVE; the right-click "デスクトップへ移動"
-  always works as a non-drag alternative.
+  Moving an item OUT of a board is done with the right-click
+  "デスクトップへ移動" menu. (v6 hotfix: v5's OLE drag-out froze
+  the UI via DoDragDrop's modal loop, and v5's grab-set drag could
+  leave a grab behind that blocked the toolbar buttons. v6 drags
+  use NO grab at all: root-level handlers follow the drag, every
+  new press force-finishes a stale drag, and a watchdog clears a
+  drag whose mouse button is no longer held.)
   Intake: native Windows drag & drop (WM_DROPFILES via ctypes, no
   external library) OR the guaranteed "＋ファイル" button. Dropped /
   chosen items enter the board folder with the Explorer rule
@@ -625,289 +628,17 @@ def recycle_bin_delete(paths):
 
 def desktop_dir():
     """The user's real Desktop folder (where デスクトップへ移動 sends
-    items and where an OLE drag-out usually lands)."""
+    items)."""
     return os.path.join(os.path.expanduser("~"), "Desktop")
 
 
-# ------------------------------------------- OLE drag OUT (Windows only)
-def _hdrop_payload(paths):
-    """Bytes of a CF_HDROP payload (DROPFILES header + file list).
-
-    Pure function (platform independent, unit-tested): a 20-byte
-    DROPFILES header (pFiles=20, pt=(0,0), fNC=FALSE, fWide=TRUE)
-    followed by the double-null-terminated UTF-16LE path list.
-    """
-    import struct
-
-    names = "\0".join(os.path.abspath(p) for p in paths) + "\0\0"
-    header = struct.pack("<IiiII", 20, 0, 0, 0, 1)
-    return header + names.encode("utf-16-le")
-
-
-def ole_drag_out(paths):
-    """Start a native OLE drag of *paths*; return the final drop
-    effect (2 = DROPEFFECT_MOVE, 1 = COPY, 0 = none/cancel/error).
-
-    Implements IDataObject (CF_HDROP) + IDropSource in ctypes and
-    calls ole32.DoDragDrop. Windows only - returns 0 elsewhere and on
-    any failure, so callers can always fall back gracefully. Must be
-    called while the left mouse button is physically held down (it
-    is, from a drag-motion handler) on a thread with a message loop.
-    """
-    if sys.platform != "win32" or not paths:
-        return 0
-    try:
-        return _ole_drag_out_win32([os.path.abspath(p) for p in paths])
-    except Exception:
-        return 0
-
-
-def _ole_drag_out_win32(paths):
-    import ctypes
-    from ctypes import wintypes
-
-    ole32 = ctypes.windll.ole32
-    kernel32 = ctypes.windll.kernel32
-
-    S_OK = 0
-    E_NOTIMPL = -2147467263          # 0x80004001
-    E_NOINTERFACE = -2147467262      # 0x80004002
-    E_INVALIDARG = -2147024809       # 0x80070057
-    DV_E_FORMATETC = -2147221404     # 0x80040064
-    DRAGDROP_S_DROP = 0x00040100
-    DRAGDROP_S_CANCEL = 0x00040101
-    DRAGDROP_S_USEDEFAULTCURSORS = 0x00040102
-    DROPEFFECT_COPY = 1
-    DROPEFFECT_MOVE = 2
-    CF_HDROP = 15
-    TYMED_HGLOBAL = 0x0001
-    DVASPECT_CONTENT = 1
-    GMEM_MOVEABLE = 0x0002
-    GMEM_ZEROINIT = 0x0040
-    MK_LBUTTON = 0x0001
-    DATADIR_GET = 1
-
-    ole32.OleInitialize(None)
-
-    def _iid_bytes(text):
-        buf = ctypes.create_unicode_buffer(40)
-        guid = ctypes.create_string_buffer(16)
-        ole32.IIDFromString(text, guid)
-        return guid.raw
-
-    IID_IUNKNOWN = _iid_bytes("{00000000-0000-0000-C000-000000000046}")
-    IID_IDATAOBJECT = _iid_bytes("{0000010E-0000-0000-C000-000000000046}")
-    IID_IDROPSOURCE = _iid_bytes("{00000121-0000-0000-C000-000000000046}")
-
-    class FORMATETC(ctypes.Structure):
-        _fields_ = [("cfFormat", wintypes.WORD),
-                    ("ptd", ctypes.c_void_p),
-                    ("dwAspect", wintypes.DWORD),
-                    ("lindex", ctypes.c_long),
-                    ("tymed", wintypes.DWORD)]
-
-    class STGMEDIUM(ctypes.Structure):
-        _fields_ = [("tymed", wintypes.DWORD),
-                    ("hGlobal", ctypes.c_void_p),
-                    ("pUnkForRelease", ctypes.c_void_p)]
-
-    HRESULT = ctypes.c_long
-    LPTHIS = ctypes.c_void_p
-    QI_T = ctypes.WINFUNCTYPE(HRESULT, LPTHIS, ctypes.c_void_p,
-                              ctypes.c_void_p)
-    REF_T = ctypes.WINFUNCTYPE(wintypes.ULONG, LPTHIS)
-    GETDATA_T = ctypes.WINFUNCTYPE(HRESULT, LPTHIS,
-                                   ctypes.POINTER(FORMATETC),
-                                   ctypes.POINTER(STGMEDIUM))
-    GETHERE_T = ctypes.WINFUNCTYPE(HRESULT, LPTHIS,
-                                   ctypes.POINTER(FORMATETC),
-                                   ctypes.POINTER(STGMEDIUM))
-    QUERYGET_T = ctypes.WINFUNCTYPE(HRESULT, LPTHIS,
-                                    ctypes.POINTER(FORMATETC))
-    CANON_T = ctypes.WINFUNCTYPE(HRESULT, LPTHIS,
-                                 ctypes.POINTER(FORMATETC),
-                                 ctypes.POINTER(FORMATETC))
-    SETDATA_T = ctypes.WINFUNCTYPE(HRESULT, LPTHIS,
-                                   ctypes.POINTER(FORMATETC),
-                                   ctypes.POINTER(STGMEDIUM),
-                                   wintypes.BOOL)
-    ENUMFMT_T = ctypes.WINFUNCTYPE(HRESULT, LPTHIS, wintypes.DWORD,
-                                   ctypes.c_void_p)
-    DADVISE_T = ctypes.WINFUNCTYPE(HRESULT, LPTHIS,
-                                   ctypes.POINTER(FORMATETC),
-                                   wintypes.DWORD, ctypes.c_void_p,
-                                   ctypes.POINTER(wintypes.DWORD))
-    DUNADVISE_T = ctypes.WINFUNCTYPE(HRESULT, LPTHIS, wintypes.DWORD)
-    ENUMADV_T = ctypes.WINFUNCTYPE(HRESULT, LPTHIS, ctypes.c_void_p)
-    QCONT_T = ctypes.WINFUNCTYPE(HRESULT, LPTHIS, wintypes.BOOL,
-                                 wintypes.DWORD)
-    FEEDBACK_T = ctypes.WINFUNCTYPE(HRESULT, LPTHIS, wintypes.DWORD)
-
-    class IDataObjectVtbl(ctypes.Structure):
-        _fields_ = [("QueryInterface", QI_T), ("AddRef", REF_T),
-                    ("Release", REF_T), ("GetData", GETDATA_T),
-                    ("GetDataHere", GETHERE_T),
-                    ("QueryGetData", QUERYGET_T),
-                    ("GetCanonicalFormatEtc", CANON_T),
-                    ("SetData", SETDATA_T), ("EnumFormatEtc", ENUMFMT_T),
-                    ("DAdvise", DADVISE_T), ("DUnadvise", DUNADVISE_T),
-                    ("EnumDAdvise", ENUMADV_T)]
-
-    class IDropSourceVtbl(ctypes.Structure):
-        _fields_ = [("QueryInterface", QI_T), ("AddRef", REF_T),
-                    ("Release", REF_T),
-                    ("QueryContinueDrag", QCONT_T),
-                    ("GiveFeedback", FEEDBACK_T)]
-
-    class ComObject(ctypes.Structure):
-        _fields_ = [("lpVtbl", ctypes.c_void_p)]
-
-    payload = _hdrop_payload(paths)
-    keepalive = []  # vtables, callback objects, COM objects
-
-    def _make_qi(iids, refs):
-        def qi(this, riid, ppv):
-            if not ppv:
-                return E_INVALIDARG
-            out = ctypes.cast(ppv, ctypes.POINTER(ctypes.c_void_p))
-            if ctypes.string_at(riid, 16) in iids:
-                out[0] = this
-                refs[0] += 1
-                return S_OK
-            out[0] = None
-            return E_NOINTERFACE
-        return QI_T(qi)
-
-    def _make_refs(refs):
-        def addref(this):
-            refs[0] += 1
-            return refs[0]
-
-        def release(this):
-            refs[0] -= 1
-            return max(refs[0], 0)
-        return REF_T(addref), REF_T(release)
-
-    def _set_null(ppv):
-        if ppv:
-            ctypes.cast(ppv, ctypes.POINTER(ctypes.c_void_p))[0] = None
-
-    # ---------------- IDataObject ----------------
-    drefs = [1]
-
-    def _format_ok(fmt):
-        return (fmt and fmt.contents.cfFormat == CF_HDROP
-                and fmt.contents.dwAspect == DVASPECT_CONTENT
-                and (fmt.contents.tymed & TYMED_HGLOBAL))
-
-    def get_data(this, fmt, medium):
-        if not _format_ok(fmt):
-            return DV_E_FORMATETC
-        size = len(payload)
-        hglob = kernel32.GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT,
-                                     size)
-        if not hglob:
-            return -2147024882  # E_OUTOFMEMORY 0x8007000E
-        locked = kernel32.GlobalLock(hglob)
-        if not locked:
-            kernel32.GlobalFree(hglob)
-            return -2147024882
-        ctypes.memmove(locked, payload, size)
-        kernel32.GlobalUnlock(hglob)
-        medium.contents.tymed = TYMED_HGLOBAL
-        medium.contents.hGlobal = hglob
-        medium.contents.pUnkForRelease = None
-        return S_OK
-
-    def get_data_here(this, fmt, medium):
-        return E_NOTIMPL
-
-    def query_get_data(this, fmt):
-        return S_OK if _format_ok(fmt) else DV_E_FORMATETC
-
-    def get_canon(this, fmt_in, fmt_out):
-        # No canonical form distinct from the input: zero the output
-        # FORMATETC and return DATA_S_SAMEFORMATETC (0x00040130).
-        if fmt_out:
-            ctypes.memset(fmt_out, 0, ctypes.sizeof(FORMATETC))
-        return 0x00040130
-
-    def set_data(this, fmt, medium, release):
-        return E_NOTIMPL
-
-    def enum_format(this, direction, ppenum):
-        _set_null(ppenum)
-        return E_NOTIMPL
-
-    def d_advise(this, fmt, advf, sink, connection):
-        if connection:
-            connection[0] = 0
-        return -2147221501  # OLE_E_ADVISENOTSUPPORTED (0x80040003)
-
-    def d_unadvise(this, connection):
-        return E_NOTIMPL
-
-    def enum_d_advise(this, ppenum):
-        _set_null(ppenum)
-        return E_NOTIMPL
-
-    d_vtbl = IDataObjectVtbl()
-    d_addref, d_release = _make_refs(drefs)
-    d_vtbl.QueryInterface = _make_qi((IID_IUNKNOWN, IID_IDATAOBJECT),
-                                     drefs)
-    d_vtbl.AddRef = d_addref
-    d_vtbl.Release = d_release
-    d_vtbl.GetData = GETDATA_T(get_data)
-    d_vtbl.GetDataHere = GETHERE_T(get_data_here)
-    d_vtbl.QueryGetData = QUERYGET_T(query_get_data)
-    d_vtbl.GetCanonicalFormatEtc = CANON_T(get_canon)
-    d_vtbl.SetData = SETDATA_T(set_data)
-    d_vtbl.EnumFormatEtc = ENUMFMT_T(enum_format)
-    d_vtbl.DAdvise = DADVISE_T(d_advise)
-    d_vtbl.DUnadvise = DUNADVISE_T(d_unadvise)
-    d_vtbl.EnumDAdvise = ENUMADV_T(enum_d_advise)
-    data_obj = ComObject()
-    data_obj.lpVtbl = ctypes.addressof(d_vtbl)
-    keepalive += [d_vtbl, data_obj]
-
-    # ---------------- IDropSource ----------------
-    srefs = [1]
-
-    def query_continue(this, escape_pressed, key_state):
-        if escape_pressed:
-            return DRAGDROP_S_CANCEL
-        if not (key_state & MK_LBUTTON):
-            return DRAGDROP_S_DROP
-        return S_OK
-
-    def give_feedback(this, effect):
-        return DRAGDROP_S_USEDEFAULTCURSORS
-
-    s_vtbl = IDropSourceVtbl()
-    s_addref, s_release = _make_refs(srefs)
-    s_vtbl.QueryInterface = _make_qi((IID_IUNKNOWN, IID_IDROPSOURCE),
-                                     srefs)
-    s_vtbl.AddRef = s_addref
-    s_vtbl.Release = s_release
-    s_vtbl.QueryContinueDrag = QCONT_T(query_continue)
-    s_vtbl.GiveFeedback = FEEDBACK_T(give_feedback)
-    src_obj = ComObject()
-    src_obj.lpVtbl = ctypes.addressof(s_vtbl)
-    keepalive += [s_vtbl, src_obj]
-
-    ole32.DoDragDrop.restype = HRESULT
-    ole32.DoDragDrop.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
-                                 wintypes.DWORD,
-                                 ctypes.POINTER(wintypes.DWORD)]
-    effect = wintypes.DWORD(0)
-    hr = ole32.DoDragDrop(ctypes.addressof(data_obj),
-                          ctypes.addressof(src_obj),
-                          DROPEFFECT_COPY | DROPEFFECT_MOVE,
-                          ctypes.byref(effect))
-    del keepalive
-    if hr in (S_OK, DRAGDROP_S_DROP):
-        return int(effect.value)
-    return 0
+# ------------------------------------------- drag OUT (v6: menu only)
+# v6: the v5 OLE drag-source (ctypes IDataObject/IDropSource +
+# ole32.DoDragDrop called from a Tk motion handler) was REMOVED:
+# DoDragDrop runs its own modal loop and froze the UI on the
+# user's real PC. Moving an item out of a board is done ONLY via
+# the right-click menu (place_dropped_items helper). No event
+# path in this file starts an OLE drag anymore.
 
 
 # ------------------------------------------------------------------ self-test
@@ -1192,22 +923,14 @@ def run_self_test():
             assert (rt["notes"][0]["col"], rt["notes"][0]["row"]) == (0, 0)
             assert rt["size_percent"] == 80
 
-            # ---------- OLE drag-out payload (pure part) -------------
-            payload = _hdrop_payload([os.path.join(tmp, "x.txt"),
-                                      os.path.join(tmp, "y.txt")])
-            import struct as _struct
-            p_files, _px, _py, _fnc, f_wide = _struct.unpack(
-                "<IiiII", payload[:20])
-            assert p_files == 20 and f_wide == 1
-            listed = payload[20:].decode("utf-16-le").split("\0")
-            assert listed[0].endswith("x.txt"), listed
-            assert listed[1].endswith("y.txt"), listed
-            assert listed[2] == "" and listed[3] == ""
-            # the OLE entry point must refuse safely off Windows
-            if sys.platform != "win32":
-                assert ole_drag_out([os.path.join(tmp, "x.txt")]) == 0
+            # ---------- v6: the OLE drag-out must be GONE -----------
+            # v5's DoDragDrop drag-source froze the UI on a real PC;
+            # moving out is only the right-click menu helper below
+            assert "ole_drag_out" not in globals()
+            assert "_ole_drag_out_win32" not in globals()
+            assert "_hdrop_payload" not in globals()
 
-            # ---------- move OUT of a board (desktop fallback) ------
+            # ---------- move OUT of a board (desktop menu) ------
             desk = os.path.join(tmp, "Desktop")
             os.mkdir(desk)
             out_board = os.path.join(tmp, "outboard")
@@ -1592,7 +1315,7 @@ def run_gui():
             self.thumb_cache = {}  # (path, percent) -> PhotoImage
             self.known_names = set()
             self.drag = {"tag": None, "dx": 0, "dy": 0}
-            self.ole_active = False   # True while DoDragDrop runs
+            self._drag_started_at = 0.0
             self._last_focus_rescan = 0
             self.board_rpc = rows_per_column(
                 640, size_metrics(DEFAULT_PERCENT)["cell_h"])
@@ -1614,6 +1337,7 @@ def run_gui():
             self.root.bind_all("<FocusIn>", self._on_focus_in)
             self.root.after(60, self.setup_drop)
             self.root.after(POLL_MS, self.poll_folder)
+            self.root.after(700, self._drag_watchdog)
 
         def _on_focus_in(self, event):
             import time
@@ -1623,6 +1347,89 @@ def run_gui():
                 return  # FocusIn fires in bursts; coalesce them
             self._last_focus_rescan = now
             self.root.after(30, self._rescan_board)
+
+        # ------------------------------------------------ v6 drag safety
+        # v5's drag called grab-set() on the canvas: if a release was
+        # ever missed, the grab stayed in place and the toolbar
+        # buttons stopped responding (the user's v5 report), and the
+        # automatic OLE DoDragDrop handover modal-looped the UI.
+        # v6 therefore: (a) never grabs anything for a drag;
+        # (b) while a drag runs, root-level (bind_all) motion/release
+        # handlers follow it wherever the pointer goes; (c) every new
+        # ButtonPress first force-finishes any stale drag (snap+save
+        # at the last known position); (d) a watchdog force-finishes
+        # a drag whose mouse button is no longer held down.
+        def _arm_drag(self, which):
+            import time
+
+            self._drag_started_at = time.monotonic()
+            try:
+                if which == "board":
+                    self.root.bind_all("<B1-Motion>", self.on_move,
+                                       add="+")
+                else:
+                    self.root.bind_all("<B1-Motion>", self.home_move,
+                                       add="+")
+                self.root.bind_all("<ButtonRelease-1>",
+                                   self._drag_release_all, add="+")
+            except Exception:
+                pass
+
+        def _disarm_drag(self):
+            try:
+                self.root.unbind_all("<B1-Motion>")
+                self.root.unbind_all("<ButtonRelease-1>")
+            except Exception:
+                pass
+
+        def _drag_release_all(self, event):
+            # root-level release: finish whichever drag is active
+            # (finishing is idempotent - a second call is a no-op)
+            if self.drag.get("tag"):
+                self.on_release(event)
+            elif self.home_drag.get("tag"):
+                self.home_release(event)
+
+        def _press_recovery(self, event):
+            # widget-level press (e.g. on empty board): force-finish
+            # a STALE drag. A press that just started a drag via the
+            # item binding microseconds ago is left alone (age
+            # guard), whichever order the two bindings fire in.
+            import time
+
+            if time.monotonic() - self._drag_started_at < 0.3:
+                return
+            self._force_finish_board_drag()
+            self._force_finish_home_drag()
+
+        def _force_finish_board_drag(self):
+            if self.drag.get("tag"):
+                self.on_release()
+
+        def _force_finish_home_drag(self):
+            if self.home_drag.get("tag"):
+                self.home_release()
+
+        def _button_held(self):
+            if sys.platform == "win32":
+                try:
+                    import ctypes
+                    state = ctypes.windll.user32.GetAsyncKeyState(0x01)
+                    return bool(state & 0x8000)
+                except Exception:
+                    return True
+            return True  # unknown platform: assume held, do nothing
+
+        def _drag_watchdog(self):
+            try:
+                active = self.drag.get("tag") or self.home_drag.get("tag")
+                if active and not self._button_held():
+                    self._force_finish_board_drag()
+                    self._force_finish_home_drag()
+            except Exception:
+                pass
+            finally:
+                self.root.after(700, self._drag_watchdog)
 
         # ------------------------------------------------------------ helpers
         @property
@@ -1729,6 +1536,8 @@ def run_gui():
             # can finish) even when the pointer leaves the icon itself
             self.home_canvas.bind("<B1-Motion>", self.home_move)
             self.home_canvas.bind("<ButtonRelease-1>", self.home_release)
+            self.home_canvas.bind("<ButtonPress-1>",
+                                  self._press_recovery)
 
         def _home_configure(self, event):
             draw_gradient(self.home_canvas, self.theme)
@@ -1759,10 +1568,12 @@ def run_gui():
             self.canvas.pack(side="top", fill="both", expand=True)
             self.canvas.bind("<Configure>", self._board_configure)
             # widget-level drag bindings (see home canvas): motion /
-            # release keep working when the pointer leaves the card
-            # or even the window (a grab is held during drags)
+            # release keep working when the pointer leaves the card;
+            # during a drag, root-level handlers are armed as well
+            # (v6: no widget grab is used anywhere)
             self.canvas.bind("<B1-Motion>", self.on_move)
             self.canvas.bind("<ButtonRelease-1>", self.on_release)
+            self.canvas.bind("<ButtonPress-1>", self._press_recovery)
 
         def _board_configure(self, event):
             draw_gradient(self.canvas, self.theme)
@@ -1865,7 +1676,7 @@ def run_gui():
 
         def update_board_hint(self, extra=""):
             if self.drop.active:
-                hint = "ファイルをここに落とせます"
+                hint = "ファイルをここに落とせます（外へ出す時は右クリック→デスクトップへ移動）"
             else:
                 hint = "ドラッグで入らない時は＋ファイルを使ってね"
             text = self.board_name
@@ -1967,6 +1778,10 @@ def run_gui():
             return None
 
         def home_press(self, event):
+            # v6: a new press anywhere first force-finishes any
+            # stale drag left behind by a missed release
+            self._force_finish_home_drag()
+            self._force_finish_board_drag()
             tag = self.home_tag()
             if not tag or tag not in self.home_items:
                 return
@@ -1976,13 +1791,9 @@ def run_gui():
             self.home_drag = {"tag": tag, "dx": event.x - x,
                               "dy": event.y - y, "x": x, "y": y}
             self.home_canvas.tag_raise(tag)
-            try:
-                # keep motion/release events coming to this canvas
-                # even if the pointer leaves the icon or the window,
-                # so a drag can never get "stuck" half-finished
-                self.home_canvas.grab_set()
-            except Exception:
-                pass
+            # v6: NO grab-set (a leftover grab blocked the toolbar
+            # in v5); root-level handlers follow the drag instead
+            self._arm_drag("home")
 
         def home_move(self, event):
             tag = self.home_drag.get("tag")
@@ -2003,10 +1814,7 @@ def run_gui():
             drag = self.home_drag
             self.home_drag = {"tag": None, "dx": 0, "dy": 0,
                               "x": 0, "y": 0}
-            try:
-                self.root.grab_release()
-            except Exception:
-                pass
+            self._disarm_drag()
             name = self.home_items.get(tag)
             if name is None:
                 return
@@ -2144,13 +1952,13 @@ def run_gui():
             """Reflect the board folder's REAL contents on the board.
 
             Files added outside appear; files moved/removed outside
-            (Explorer, an OLE drag-out, デスクトップへ移動) disappear.
-            Never runs while a card drag or an OLE drag is in flight,
+            (Explorer, デスクトップへ移動) disappear.
+            Never runs while a card drag is in flight,
             so it can never undo or fight a move the user is making.
             """
             if self.view != "board" or not self.board_folder:
                 return
-            if self.drag.get("tag") or self.ole_active:
+            if self.drag.get("tag"):
                 return
             names = {e["name"] for e in scan_folder(self.board_folder)}
             if names != self.known_names:
@@ -2159,11 +1967,11 @@ def run_gui():
                 self.render_board()
 
         def render_board(self):
-            # a re-render must never fight an in-progress drag or an
-            # OLE drag-out (it would recreate the dragged card's items
-            # and lose the drag); callers that finish a drag clear the
+            # a re-render must never fight an in-progress drag (it
+            # would recreate the dragged card's items and lose the
+            # drag); callers that finish a drag clear the
             # state first and only then render
-            if self.drag.get("tag") or self.ole_active:
+            if self.drag.get("tag"):
                 return
             c = self.canvas
             for tag in list(self.items):
@@ -2303,6 +2111,10 @@ def run_gui():
             return None
 
         def on_press(self, event):
+            # v6: a new press anywhere first force-finishes any
+            # stale drag left behind by a missed release
+            self._force_finish_board_drag()
+            self._force_finish_home_drag()
             tag = self.card_tag()
             if not tag or tag not in self.items:
                 return
@@ -2310,15 +2122,9 @@ def run_gui():
             self.drag = {"tag": tag, "dx": event.x - info["x"],
                          "dy": event.y - info["y"]}
             self.canvas.tag_raise(tag)
-            try:
-                # hold a grab for the whole drag: motion/release keep
-                # arriving at this canvas even outside the card or
-                # the window, so a release can never be missed (in v4
-                # a release outside the card left the drag state stuck
-                # and the poll guard then blocked re-rendering)
-                self.canvas.grab_set()
-            except Exception:
-                pass
+            # v6: NO grab-set (a leftover grab blocked the toolbar
+            # in v5); root-level handlers follow the drag instead
+            self._arm_drag("board")
 
         def on_move(self, event):
             tag = self.drag.get("tag")
@@ -2331,7 +2137,6 @@ def run_gui():
             nx, ny = event.x - self.drag["dx"], event.y - self.drag["dy"]
             self.canvas.move(tag, nx - info["x"], ny - info["y"])
             info["x"], info["y"] = nx, ny
-            self._maybe_ole_drag_out(event, info)
 
         def on_release(self, event=None):
             tag = self.drag.get("tag")
@@ -2342,10 +2147,7 @@ def run_gui():
             # binding fires right after the item-level one and must
             # find nothing left to do; render_board also keys off it
             self.drag = {"tag": None, "dx": 0, "dy": 0}
-            try:
-                self.root.grab_release()
-            except Exception:
-                pass
+            self._disarm_drag()
             if info is None:
                 return
             m = self.metrics
@@ -2361,44 +2163,6 @@ def run_gui():
             # saved position = exactly the cell we just computed;
             # render_board re-draws from it (and persists it)
             self.render_board()
-
-        def _maybe_ole_drag_out(self, event, info):
-            """Pointer left the window mid-drag with a file/folder
-            card -> hand the drag over to native OLE (DoDragDrop) so
-            the item can be dropped on the Desktop / Explorer."""
-            if sys.platform != "win32" or self.ole_active:
-                return
-            if info["kind"] == "note" or not self.board_folder:
-                return
-            w = self.canvas.winfo_width()
-            h = self.canvas.winfo_height()
-            if not (event.x < -16 or event.y < -16
-                    or event.x > w + 16 or event.y > h + 16):
-                return
-            path = os.path.join(self.board_folder, info["name"])
-            if not os.path.exists(path):
-                return
-            # end the internal drag WITHOUT snapping: saved cells are
-            # still the pre-drag ones, which is where the card returns
-            # if the OLE drag is cancelled or ends in a copy
-            self.drag = {"tag": None, "dx": 0, "dy": 0}
-            try:
-                self.root.grab_release()
-            except Exception:
-                pass
-            self.ole_active = True
-            try:
-                effect = ole_drag_out([path])
-            except Exception:
-                effect = 0
-            self.ole_active = False
-            # the folder contents are the source of truth now: if the
-            # item was moved out, its card disappears; if it is still
-            # there, the re-render snaps it back to its saved cell
-            self._rescan_board()
-            self.render_board()
-            if effect == 2:  # DROPEFFECT_MOVE
-                self.update_board_hint("外へ移動しました")
 
         def on_double(self, event):
             # a double-click is not a drag: finish any drag state the
@@ -2499,7 +2263,7 @@ def run_gui():
             self.render_board()
 
         def move_to_desktop_ui(self, info):
-            """Right-click fallback for drag-out (always available):
+            """Move out of a board (v6: the ONLY way out):
             move the real file/folder to the Desktop folder; the
             card disappears because the board folder loses the item.
             """
@@ -2548,6 +2312,7 @@ def run_gui():
 
     root = tk.Tk()
     app = App(root)
+    root._okiba_app = app  # exposed for tools/gui_smoke.py
     # If launched with a folder argument inside the boards base, open it.
     for arg in sys.argv[1:]:
         if os.path.isdir(arg):
