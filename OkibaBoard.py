@@ -1,13 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-OkibaBoard v6 - Deskboard-style board app (Python + Tkinter, stdlib only)
+OkibaBoard v7 - Deskboard-style board app (Python + Tkinter, stdlib only)
 
 Model: MULTIPLE BOARDS, like files on a home screen.
 - Launch -> HOME screen (dark, desktop-like) with board icons.
   Boards are REAL folders under ``<SystemDrive>\\OkibaBoards``
-  (typically ``C:\\OkibaBoards``; on first run an old
-  ``~/Documents/OkibaBoards`` is moved there automatically - if the
-  move fails the old folder keeps being used, nothing is lost).
+  (typically ``C:\\OkibaBoards``). Updating the tool = replacing
+  this exe only: boards and their contents live OUTSIDE the exe and
+  carry over automatically. On startup, boards still sitting in the
+  legacy ``~/Documents/OkibaBoards`` are merged in: a board whose
+  name is not yet in the current base is moved over (if the whole
+  old base is still the only one, it is moved as one piece, as
+  before); boards existing in both places are never overwritten,
+  and a failed move leaves the legacy board untouched. If anything
+  was carried over, the home screen says so in one line.
   One button only: "＋ボード" - it ALWAYS asks for a name first, so
   the user freely names every board (the name is the real folder
   name; unusable characters are rejected with an explanation, never
@@ -21,26 +27,42 @@ Model: MULTIPLE BOARDS, like files on a home screen.
   icons. Dragging a card and letting go snaps it to the nearest cell;
   if that cell is taken, the two cards SWAP cells. Cells are saved to
   ``.okiba-board.json`` inside the board folder.
-  Card size is adjustable in percent with one toolbar button
-  "大きさ: 80%" etc. (cycles 25/30/40/50/60/70/80/90/100/125 percent
-  of the base 中 size; card size, grid cell and font change together;
-  saved per board as "size_percent"; v4's 小/中/大 are migrated).
-  Buttons: "← もどる", "＋メモ", "＋ファイル", "大きさ: …%".
+  Cards look like real desktop icons: the icon / thumbnail sits in
+  the upper area and the NAME is shown below it, wrapped over up to
+  3 lines (fewer at tiny sizes), with a hover tooltip for the full
+  name - no more one-line truncation.
+  Card size is chosen (not cycled) from a "大きさ" dropdown:
+  25/30/40/50/60/70/80/90/100/125 percent of the base 中 size
+  (card size, grid cell and font change together; saved per board
+  as "size_percent"; v4's 小/中/大 are migrated).
+  Buttons: "← もどる", the size dropdown, "テーマ: …". (v7: the
+  "＋メモ" and "＋ファイル" buttons are gone - the user never used
+  them. Existing note cards in saved boards still load, display,
+  and can be edited/deleted via right-click.)
   Right-click a file card: 開く / 場所を開く / デスクトップへ移動 /
   rename (renames the real file) / send to Recycle Bin.
   Double-click opens the real file.
-  Moving an item OUT of a board is done with the right-click
-  "デスクトップへ移動" menu. (v6 hotfix: v5's OLE drag-out froze
-  the UI via DoDragDrop's modal loop, and v5's grab-set drag could
-  leave a grab behind that blocked the toolbar buttons. v6 drags
-  use NO grab at all: root-level handlers follow the drag, every
-  new press force-finishes a stale drag, and a watchdog clears a
-  drag whose mouse button is no longer held.)
+  Moving an item OUT of a board, second attempt (v7): dragging a
+  card OUT of the window starts a native OLE drag (ctypes
+  IDataObject CF_HDROP + IDropSource + ole32.DoDragDrop) so the
+  file can be dropped on the desktop / Explorer and really moves;
+  the board re-scans and the card disappears. Safety design (the
+  v5 freeze must not come back): DoDragDrop is NEVER called from
+  inside a motion/event handler and no grab is ever taken - a
+  root.after() poll watches the pointer during an internal drag,
+  and when it leaves the window with the button still held, the
+  internal drag is finished cleanly FIRST and the OLE start is
+  scheduled via root.after() as an idle callback; any OLE error
+  restores the card and reports on the status line instead of
+  freezing. The right-click "デスクトップへ移動" remains as the
+  guaranteed fallback. (v6 stability rules all stay: NO grab-set
+  anywhere, root-level drag handlers, every new press force-
+  finishes a stale drag, watchdog clears a drag whose mouse
+  button is no longer held.)
   Intake: native Windows drag & drop (WM_DROPFILES via ctypes, no
-  external library) OR the guaranteed "＋ファイル" button. Dropped /
-  chosen items enter the board folder with the Explorer rule
-  (same drive = move, different drive = copy, never overwrite -
-  a " (2)" suffix is added instead).
+  external library). Dropped items enter the board folder with the
+  Explorer rule (same drive = move, different drive = copy, never
+  overwrite - a " (2)" suffix is added instead).
   The folder is polled every ~2 seconds (and re-scanned when the
   window regains focus) so outside changes appear/disappear.
   Look: dark themes only - "テーマ: …" toolbar buttons cycle
@@ -51,11 +73,12 @@ Model: MULTIPLE BOARDS, like files on a home screen.
 
 Headless self-test (used by CI):
     OkibaBoard.exe --self-test
-    -> exercises base resolution + migration, grid math, board/home
-       handling, scanning, save/load and the intake helper without a
-       GUI, writes ``self-test-ok.txt``, exits 0.
-    (Set OKIBA_BASE to a temp dir to keep the test away from the
-     real C:\\ and Documents folders.)
+    -> exercises base resolution + merge migration, grid math,
+       board/home handling, scanning, save/load, the intake helper
+       and the drag-out HDROP payload builder without a GUI,
+       writes ``self-test-ok.txt``, exits 0.
+    (Set OKIBA_BASE / OKIBA_OLD_BASE to temp dirs to keep the test
+     away from the real C:\\ and Documents folders.)
 """
 
 import json
@@ -72,6 +95,7 @@ POLL_MS = 2000
 BASE_DIR_NAME = "OkibaBoards"
 DEFAULT_BOARD_NAME = "ボード1"
 BASE_ENV_VAR = "OKIBA_BASE"
+OLD_BASE_ENV_VAR = "OKIBA_OLD_BASE"
 
 # ------------------------------------------------------------------- grid
 ORIGIN = 16  # px margin before the first cell, both screens
@@ -246,7 +270,13 @@ def _cell_from_any(value, cell_w, cell_h):
 
 # ------------------------------------------------------- boards base / home
 def old_base_dir():
-    """Legacy (v3 and earlier) boards location: ~/Documents/OkibaBoards."""
+    """Legacy (v3 and earlier) boards location: ~/Documents/OkibaBoards.
+
+    The OKIBA_OLD_BASE environment variable overrides it (tests/CI).
+    """
+    override = os.environ.get(OLD_BASE_ENV_VAR)
+    if override:
+        return override
     docs = os.path.join(os.path.expanduser("~"), "Documents")
     return os.path.join(docs, BASE_DIR_NAME)
 
@@ -288,9 +318,73 @@ def migrate_base(old_base, new_base):
     return new_base
 
 
+# How many boards the most recent resolve_base() carried over from
+# the legacy location (the GUI shows this once on the home screen).
+MIGRATION_MOVED = 0
+
+
+def last_migration_count():
+    """Boards carried over by the latest resolve_base() call."""
+    return MIGRATION_MOVED
+
+
+def merge_legacy_boards(old_base, new_base):
+    """Merge boards from *old_base* into *new_base*; return the count.
+
+    Every board folder in the old base whose name does NOT exist in
+    the new base is moved over. A board existing in BOTH places keeps
+    the new-base one and the legacy copy is left untouched. Nothing
+    is ever overwritten, and a failed move leaves that board where
+    it was (it simply is not counted).
+    """
+    moved = 0
+    try:
+        if os.path.abspath(old_base) == os.path.abspath(new_base):
+            return 0
+        if not os.path.isdir(old_base):
+            return 0
+        os.makedirs(new_base, exist_ok=True)
+        for name in list_boards(old_base):
+            dest = os.path.join(new_base, name)
+            if os.path.exists(dest):
+                continue  # both places have it: keep both, touch none
+            try:
+                shutil.move(os.path.join(old_base, name), dest)
+                moved += 1
+            except Exception:
+                pass  # failed: the legacy board stays intact
+    except Exception:
+        return moved
+    return moved
+
+
 def resolve_base():
-    """Effective base for the app: migrate old -> new, then use it."""
-    return migrate_base(old_base_dir(), default_base_dir())
+    """Effective base for the app, carrying legacy boards over.
+
+    Cases:
+    - new base missing + old base has boards -> the whole old base
+      is moved to the new location in one piece (v4-v6 behaviour);
+      if that move fails, the old base is used as-is.
+    - new base exists -> MERGE: legacy-only boards are moved in
+      (see merge_legacy_boards); duplicates are never overwritten.
+    Also records how many boards were carried over in
+    MIGRATION_MOVED (see last_migration_count()).
+    """
+    global MIGRATION_MOVED
+    MIGRATION_MOVED = 0
+    old_base, new_base = old_base_dir(), default_base_dir()
+    if os.path.abspath(old_base) == os.path.abspath(new_base):
+        return new_base
+    if not os.path.isdir(new_base):
+        if os.path.isdir(old_base) and list_boards(old_base):
+            count = len(list_boards(old_base))
+            effective = migrate_base(old_base, new_base)
+            if effective == new_base:
+                MIGRATION_MOVED = count
+            return effective
+        return new_base
+    MIGRATION_MOVED = merge_legacy_boards(old_base, new_base)
+    return new_base
 
 
 def list_boards(base):
@@ -632,13 +726,266 @@ def desktop_dir():
     return os.path.join(os.path.expanduser("~"), "Desktop")
 
 
-# ------------------------------------------- drag OUT (v6: menu only)
-# v6: the v5 OLE drag-source (ctypes IDataObject/IDropSource +
-# ole32.DoDragDrop called from a Tk motion handler) was REMOVED:
-# DoDragDrop runs its own modal loop and froze the UI on the
-# user's real PC. Moving an item out of a board is done ONLY via
-# the right-click menu (place_dropped_items helper). No event
-# path in this file starts an OLE drag anymore.
+# ------------------------------------------- drag OUT (OLE, v7 attempt 2)
+# v5's OLE drag-source froze the UI on the user's real PC because
+# ole32.DoDragDrop (which runs its own modal loop) was called from
+# inside a Tk <B1-Motion> handler while a widget grab was active.
+# v7 brings drag-out back with a safe trigger (see App._drag_out_tick
+# / App._ole_drag_out_now): DoDragDrop is ONLY ever called from a
+# root.after() idle callback, after the internal drag state has been
+# finished cleanly, and never while any grab exists (this app never
+# calls grab-set at all). Any failure is caught by the caller, the
+# card is restored and the status line explains - never a freeze.
+# The pure payload builder below is platform-independent so the
+# headless self-test can verify it on any OS.
+
+CF_HDROP = 15
+DROPEFFECT_NONE = 0
+DROPEFFECT_COPY = 1
+DROPEFFECT_MOVE = 2
+
+
+def build_hdrop_payload(paths):
+    """Bytes of a CF_HDROP payload (DROPFILES header + file list).
+
+    Layout: a 20-byte header (pFiles offset, drop point, fNC,
+    fWide=1) followed by the absolute paths as UTF-16LE, each
+    NUL-terminated, with a final extra NUL ending the list.
+    """
+    import struct
+
+    names = [os.path.abspath(p) for p in paths if p]
+    body = ("\0".join(names) + "\0\0").encode("utf-16-le")
+    header = struct.pack("<IiiII", 20, 0, 0, 0, 1)
+    return header + body
+
+
+def parse_hdrop_payload(data):
+    """Inverse of build_hdrop_payload (used by the self-test)."""
+    import struct
+
+    p_files, _x, _y, _fnc, f_wide = struct.unpack("<IiiII", data[:20])
+    text = data[p_files:].decode("utf-16-le")
+    parts = text.split("\0")
+    out = []
+    for part in parts:
+        if not part:
+            break
+        out.append(part)
+    return out, bool(f_wide)
+
+
+def ole_drag_out_available():
+    """True when the native OLE drag-out can run (Windows only)."""
+    return sys.platform == "win32"
+
+
+def ole_drag_out(paths):
+    """Start a native OLE drag for *paths*; return the drop effect.
+
+    Returns DROPEFFECT_MOVE / DROPEFFECT_COPY when the drop target
+    performed that operation, None when the drag was cancelled or
+    no drop happened. Windows only; raises on hard failures (the
+    GUI caller catches and restores the card). Must be called from
+    a normal (idle) context, never from inside an event handler -
+    DoDragDrop runs its own modal message loop until the drop ends.
+    """
+    if not ole_drag_out_available():
+        return None
+    return _ole_drag_out_win32(list(paths))
+
+
+def _ole_drag_out_win32(paths):
+    """ctypes implementation of an OLE drag source (CF_HDROP)."""
+    import ctypes
+    from ctypes import (POINTER, Structure, byref, cast, c_int, c_long,
+                        c_ubyte, c_ulong, c_ushort, c_void_p, memmove)
+
+    def hr(hex_value):
+        return hex_value - 0x100000000 if hex_value >= 0x80000000 \
+            else hex_value
+
+    S_OK = 0
+    E_NOINTERFACE = hr(0x80004002)
+    E_NOTIMPL = hr(0x80004001)
+    E_OUTOFMEMORY = hr(0x8007000E)
+    E_INVALIDARG = hr(0x80070057)
+    DV_E_FORMATETC = hr(0x80040064)
+    DRAGDROP_S_DROP = 0x00040100
+    DRAGDROP_S_CANCEL = 0x00040101
+    DRAGDROP_S_USEDEFAULTCURSORS = 0x00040102
+    TYMED_HGLOBAL = 1
+    GMEM_MOVEABLE = 0x0002
+    MK_LBUTTON = 0x0001
+
+    ole32 = ctypes.windll.ole32
+    kernel32 = ctypes.windll.kernel32
+
+    class GUID(Structure):
+        _fields_ = [("Data1", c_ulong), ("Data2", c_ushort),
+                    ("Data3", c_ushort), ("Data4", c_ubyte * 8)]
+
+    def make_iid(text):
+        guid = GUID()
+        ole32.IIDFromString(ctypes.c_wchar_p(text), byref(guid))
+        return ctypes.string_at(byref(guid), ctypes.sizeof(guid))
+
+    iid_unknown = make_iid("{00000000-0000-0000-C000-000000000046}")
+    iid_dataobject = make_iid("{0000010E-0000-0000-C000-000000000046}")
+    iid_dropsource = make_iid("{00000121-0000-0000-C000-000000000046}")
+
+    class FORMATETC(Structure):
+        _fields_ = [("cfFormat", c_ushort), ("ptd", c_void_p),
+                    ("dwAspect", c_ulong), ("lindex", c_long),
+                    ("tymed", c_ulong)]
+
+    class STGMEDIUM(Structure):
+        _fields_ = [("tymed", c_ulong), ("hGlobal", c_void_p),
+                    ("pUnkForRelease", c_void_p)]
+
+    payload = build_hdrop_payload(paths)
+    keepalive = []  # vtables + callbacks live until the drag is over
+
+    def make_query_interface(own_iid):
+        def query_interface(this, riid, ppv):
+            if not ppv:
+                return E_INVALIDARG
+            out = cast(ppv, POINTER(c_void_p))
+            out[0] = None
+            iid_bytes = ctypes.string_at(riid, ctypes.sizeof(GUID))
+            if iid_bytes in (iid_unknown, own_iid):
+                out[0] = this
+                return S_OK
+            return E_NOINTERFACE
+        return query_interface
+
+    def add_ref(this):
+        return 1
+
+    def release(this):
+        return 0
+
+    # ---- IDataObject (only CF_HDROP / TYMED_HGLOBAL is served) ----
+    def get_data(this, p_formatetc, p_medium):
+        try:
+            fmt = cast(p_formatetc, POINTER(FORMATETC)).contents
+            if fmt.cfFormat != CF_HDROP \
+                    or not (fmt.tymed & TYMED_HGLOBAL):
+                return DV_E_FORMATETC
+            kernel32.GlobalAlloc.restype = c_void_p
+            kernel32.GlobalLock.restype = c_void_p
+            hglob = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(payload))
+            if not hglob:
+                return E_OUTOFMEMORY
+            ptr = kernel32.GlobalLock(hglob)
+            if not ptr:
+                kernel32.GlobalFree(c_void_p(hglob))
+                return E_OUTOFMEMORY
+            memmove(ptr, payload, len(payload))
+            kernel32.GlobalUnlock(c_void_p(hglob))
+            med = cast(p_medium, POINTER(STGMEDIUM)).contents
+            med.tymed = TYMED_HGLOBAL
+            med.hGlobal = hglob
+            med.pUnkForRelease = None
+            return S_OK
+        except Exception:
+            return DV_E_FORMATETC
+
+    def query_get_data(this, p_formatetc):
+        try:
+            fmt = cast(p_formatetc, POINTER(FORMATETC)).contents
+            if fmt.cfFormat == CF_HDROP \
+                    and (fmt.tymed == 0 or fmt.tymed & TYMED_HGLOBAL):
+                return S_OK
+        except Exception:
+            pass
+        return DV_E_FORMATETC
+
+    def get_canonical(this, p_in, p_out):
+        try:
+            if p_out:
+                out = cast(p_out, POINTER(FORMATETC)).contents
+                out.ptd = None
+        except Exception:
+            pass
+        return hr(0x00040130)  # DATA_S_SAMEFORMATETC
+
+    def not_impl(*_args):
+        return E_NOTIMPL
+
+    W = ctypes.WINFUNCTYPE
+    qi_t = W(c_long, c_void_p, c_void_p, c_void_p)
+    ref_t = W(c_ulong, c_void_p)
+    getdata_t = W(c_long, c_void_p, c_void_p, c_void_p)
+    queryget_t = W(c_long, c_void_p, c_void_p)
+    setdata_t = W(c_long, c_void_p, c_void_p, c_void_p, c_int)
+    enumfmt_t = W(c_long, c_void_p, c_ulong, c_void_p)
+    advise_t = W(c_long, c_void_p, c_void_p, c_ulong,
+                 c_void_p, c_void_p)
+    unadvise_t = W(c_long, c_void_p, c_ulong)
+    enumadvise_t = W(c_long, c_void_p, c_void_p)
+
+    data_callbacks = [
+        qi_t(make_query_interface(iid_dataobject)),
+        ref_t(add_ref), ref_t(release),
+        getdata_t(get_data),
+        getdata_t(not_impl),                 # GetDataHere
+        queryget_t(query_get_data),
+        getdata_t(get_canonical),
+        setdata_t(not_impl),                 # SetData
+        enumfmt_t(not_impl),                 # EnumFormatEtc
+        advise_t(not_impl),                  # DAdvise
+        unadvise_t(not_impl),                # DUnadvise
+        enumadvise_t(not_impl),              # EnumDAdvise
+    ]
+
+    # ---- IDropSource ----
+    def query_continue_drag(this, escape_pressed, key_state):
+        if escape_pressed:
+            return DRAGDROP_S_CANCEL
+        if not (key_state & MK_LBUTTON):
+            return DRAGDROP_S_DROP
+        return S_OK
+
+    def give_feedback(this, effect):
+        return DRAGDROP_S_USEDEFAULTCURSORS
+
+    qcd_t = W(c_long, c_void_p, c_int, c_ulong)
+    feedback_t = W(c_long, c_void_p, c_ulong)
+    source_callbacks = [
+        qi_t(make_query_interface(iid_dropsource)),
+        ref_t(add_ref), ref_t(release),
+        qcd_t(query_continue_drag),
+        feedback_t(give_feedback),
+    ]
+
+    def make_object(callbacks):
+        vtable = (c_void_p * len(callbacks))()
+        for i, cb in enumerate(callbacks):
+            vtable[i] = cast(cb, c_void_p)
+        obj = (c_void_p * 1)()
+        obj[0] = cast(vtable, c_void_p)
+        keepalive.extend([vtable, obj])
+        keepalive.extend(callbacks)
+        return ctypes.addressof(obj)
+
+    data_obj = make_object(data_callbacks)
+    drop_source = make_object(source_callbacks)
+
+    ole32.OleInitialize(None)
+    try:
+        ole32.DoDragDrop.argtypes = [c_void_p, c_void_p, c_ulong,
+                                     POINTER(c_ulong)]
+        ole32.DoDragDrop.restype = c_long
+        effect = c_ulong(DROPEFFECT_NONE)
+        result = ole32.DoDragDrop(
+            c_void_p(data_obj), c_void_p(drop_source),
+            c_ulong(DROPEFFECT_COPY | DROPEFFECT_MOVE), byref(effect))
+    finally:
+        ole32.OleUninitialize()
+    if result == DRAGDROP_S_DROP:
+        return int(effect.value)
+    return None
 
 
 # ------------------------------------------------------------------ self-test
@@ -681,6 +1028,69 @@ def run_self_test():
             eff3 = migrate_base(old3, bad_new)
             assert eff3 == old3, eff3
             assert list_boards(old3) == ["大事なボード"]
+
+            # ---------- v7: MERGE migration (old tool -> new tool)
+            # a legacy-only board is moved into the current base
+            mg_old = os.path.join(tmp, "mg_old")
+            mg_new = os.path.join(tmp, "mg_new")
+            os.makedirs(os.path.join(mg_old, "引き継ぐボード"))
+            os.makedirs(os.path.join(mg_new, "今のボード"))
+            assert merge_legacy_boards(mg_old, mg_new) == 1
+            assert sorted(list_boards(mg_new)) == [
+                "今のボード", "引き継ぐボード"]
+            assert list_boards(mg_old) == []
+
+            # a board existing in BOTH places: neither copy is
+            # touched (no overwrite, legacy stays where it was)
+            mg_old2 = os.path.join(tmp, "mg_old2")
+            mg_new2 = os.path.join(tmp, "mg_new2")
+            for root_dir, marker in ((mg_old2, "old"), (mg_new2, "new")):
+                folder = os.path.join(root_dir, "同名ボード")
+                os.makedirs(folder)
+                with open(os.path.join(folder, "marker.txt"), "w",
+                          encoding="utf-8") as f:
+                    f.write(marker)
+            assert merge_legacy_boards(mg_old2, mg_new2) == 0
+            for root_dir, marker in ((mg_old2, "old"), (mg_new2, "new")):
+                with open(os.path.join(root_dir, "同名ボード",
+                                       "marker.txt"),
+                          encoding="utf-8") as f:
+                    assert f.read() == marker
+
+            # a failed move leaves the legacy board intact
+            mg_old3 = os.path.join(tmp, "mg_old3")
+            os.makedirs(os.path.join(mg_old3, "残るボード"))
+            assert merge_legacy_boards(
+                mg_old3, os.path.join(blocker, "sub")) == 0
+            assert list_boards(mg_old3) == ["残るボード"]
+
+            # resolve_base() performs the merge end-to-end (the
+            # env overrides point both bases at temp dirs)
+            rs_old = os.path.join(tmp, "rs_old")
+            rs_new = os.path.join(tmp, "rs_new")
+            os.makedirs(os.path.join(rs_old, "旧ボード"))
+            os.makedirs(os.path.join(rs_new, "新ボード"))
+            os.environ[OLD_BASE_ENV_VAR] = rs_old
+            os.environ[BASE_ENV_VAR] = rs_new
+            try:
+                assert resolve_base() == rs_new
+                assert last_migration_count() == 1
+                assert sorted(list_boards(rs_new)) == [
+                    "新ボード", "旧ボード"]
+                assert list_boards(rs_old) == []
+                # whole-base move through resolve_base: the new
+                # base does not exist yet, the old one is used
+                rs_old2 = os.path.join(tmp, "rs_old2")
+                rs_new2 = os.path.join(tmp, "rs_new2")
+                os.makedirs(os.path.join(rs_old2, "丸ごとボード"))
+                os.environ[OLD_BASE_ENV_VAR] = rs_old2
+                os.environ[BASE_ENV_VAR] = rs_new2
+                assert resolve_base() == rs_new2
+                assert last_migration_count() == 1
+                assert list_boards(rs_new2) == ["丸ごとボード"]
+            finally:
+                del os.environ[OLD_BASE_ENV_VAR]
+                del os.environ[BASE_ENV_VAR]
 
             # ---------- boards base & home layout ----------
             base = os.path.join(tmp, "boards")
@@ -923,12 +1333,21 @@ def run_self_test():
             assert (rt["notes"][0]["col"], rt["notes"][0]["row"]) == (0, 0)
             assert rt["size_percent"] == 80
 
-            # ---------- v6: the OLE drag-out must be GONE -----------
-            # v5's DoDragDrop drag-source froze the UI on a real PC;
-            # moving out is only the right-click menu helper below
-            assert "ole_drag_out" not in globals()
-            assert "_ole_drag_out_win32" not in globals()
-            assert "_hdrop_payload" not in globals()
+            # ---------- v7: OLE drag-out pure helpers ----------
+            # the OLE call itself needs a real Windows desktop, but
+            # its CF_HDROP payload is pure data and is verified here
+            sample = [os.path.join(tmp, "動画 ファイル.mp4"),
+                      os.path.join(tmp, "b.txt")]
+            payload = build_hdrop_payload(sample)
+            parsed, was_wide = parse_hdrop_payload(payload)
+            assert was_wide is True
+            assert parsed == [os.path.abspath(p) for p in sample], \
+                parsed
+            # off Windows the drag-out must report itself unavailable
+            # (the GUI then keeps the card and stays responsive)
+            if sys.platform != "win32":
+                assert ole_drag_out_available() is False
+                assert ole_drag_out(sample) is None
 
             # ---------- move OUT of a board (desktop menu) ------
             desk = os.path.join(tmp, "Desktop")
@@ -945,7 +1364,7 @@ def run_self_test():
                 "moving out must remove it from the board folder"
             assert [e["name"] for e in scan_folder(out_board)] == []
 
-            # ---------- intake helper (drop / ＋ファイル shared) ----------
+            # ---------- intake helper (drag & drop) ----------
             src_dir = os.path.join(tmp, "incoming")
             os.mkdir(src_dir)
             board_dir = os.path.join(tmp, "board2")
@@ -1162,6 +1581,72 @@ def rounded_rect_points(x, y, x2, y2, r):
     return pts
 
 
+# ------------------------------------- desktop-icon style card names
+def _char_units(ch):
+    """Rough display width of one character, in units of the font size.
+
+    Full-width characters (most Japanese) count 1.0, half-width
+    (ASCII etc.) about 0.58 - close enough for icon-label wrapping.
+    """
+    import unicodedata
+
+    return 1.0 if unicodedata.east_asian_width(ch) in ("W", "F") \
+        else 0.58
+
+
+def wrap_card_name(name, max_width_px, font_pt, max_lines):
+    """Wrap *name* like a desktop icon label and return the text.
+
+    Greedy per-character wrapping into at most *max_lines* lines.
+    Text still left over after the last line is marked with an
+    ellipsis on that line (the full name is available via tooltip).
+    """
+    max_lines = max(1, int(max_lines))
+    unit = max(float(font_pt), 1.0)
+
+    def width_of(text):
+        return sum(_char_units(c) for c in text) * unit
+
+    lines = []
+    rest = name or ""
+    while rest and len(lines) < max_lines:
+        take = 0
+        width = 0.0
+        while take < len(rest):
+            cw = _char_units(rest[take]) * unit
+            if take > 0 and width + cw > max_width_px:
+                break
+            width += cw
+            take += 1
+        lines.append(rest[:take])
+        rest = rest[take:]
+    if rest and lines:
+        last = lines[-1]
+        while last and width_of(last + "…") > max_width_px:
+            last = last[:-1]
+        lines[-1] = last + "…"
+    return "\n".join(lines)
+
+
+def card_name_lines(percent, card_h, font_pt):
+    """How many name lines a card shows at this size.
+
+    Up to 3 lines at desktop-like sizes (100%), at least 2 lines
+    from 60% up, and whatever actually fits inside the card -
+    tiny cards degrade gracefully to a single line.
+    """
+    if percent >= 80:
+        desired = 3
+    elif percent >= 40:
+        desired = 2
+    else:
+        desired = 1
+    line_h = max(int(font_pt), 1) + 3
+    icon_area = max(14, int(card_h * 0.44))
+    fit = max(1, (int(card_h) - icon_area - 4) // line_h)
+    return max(1, min(desired, fit))
+
+
 # file kind by extension -> icon + colour family (board cards)
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".wmv",
               ".m4v", ".mpg", ".mpeg"}
@@ -1315,6 +1800,9 @@ def run_gui():
             self.thumb_cache = {}  # (path, percent) -> PhotoImage
             self.known_names = set()
             self.drag = {"tag": None, "dx": 0, "dy": 0}
+            self._drag_out_polling = False  # v7: OLE drag-out watcher
+            self._ole_busy = False          # v7: an OLE drag is running
+            self._tooltip_win = None        # v7: full-name hover tooltip
             self._drag_started_at = 0.0
             self._last_focus_rescan = 0
             self.board_rpc = rows_per_column(
@@ -1327,6 +1815,11 @@ def run_gui():
             root.configure(bg=self._canvas_bg())
             self._build_home()
             self._build_board()
+            if last_migration_count() > 0:
+                # boards were carried over from the previous version
+                self.home_hint_label.config(
+                    text="前の版から %d 件のボードを引き継ぎました"
+                         % last_migration_count())
             self._sync_theme_buttons()
             self.show_home()
             root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -1431,6 +1924,102 @@ def run_gui():
             finally:
                 self.root.after(700, self._drag_watchdog)
 
+        # ------------------------------------------ v7: OLE drag-out
+        # During an internal board drag, a root.after() poll watches
+        # the pointer. If it leaves the window while the button is
+        # still physically held, the internal drag is finished
+        # cleanly FIRST and the OLE drag is started from a separate
+        # root.after() idle callback - DoDragDrop is never invoked
+        # from inside an event/motion handler (that was v5's freeze).
+        def _start_drag_out_poll(self):
+            if self._drag_out_polling:
+                return
+            self._drag_out_polling = True
+            self.root.after(40, self._drag_out_tick)
+
+        def _drag_out_tick(self):
+            if not self.drag.get("tag"):
+                self._drag_out_polling = False
+                return
+            started = False
+            try:
+                started = self._maybe_begin_drag_out()
+            except Exception:
+                started = False
+            if started:
+                self._drag_out_polling = False
+                return
+            self.root.after(40, self._drag_out_tick)
+
+        def _pointer_outside_window(self):
+            try:
+                px = self.root.winfo_pointerx()
+                py = self.root.winfo_pointery()
+                rx = self.root.winfo_rootx()
+                ry = self.root.winfo_rooty()
+                return (px < rx or py < ry
+                        or px >= rx + self.root.winfo_width()
+                        or py >= ry + self.root.winfo_height())
+            except Exception:
+                return False
+
+        def _maybe_begin_drag_out(self):
+            """Schedule an OLE drag-out if the drag left the window.
+
+            Returns True when the OLE start was scheduled. Off
+            Windows (and for note cards, which have no real file)
+            this is always False and the internal drag just
+            continues - the app stays fully responsive.
+            """
+            if not ole_drag_out_available():
+                return False
+            if self._ole_busy or self.view != "board":
+                return False
+            tag = self.drag.get("tag")
+            if not tag:
+                return False
+            info = self.items.get(tag)
+            if info is None or info["kind"] == "note":
+                return False
+            if not self._button_held():
+                return False
+            if not self._pointer_outside_window():
+                return False
+            # finish the internal drag cleanly FIRST: positions are
+            # only written on release, so a plain re-render puts the
+            # card back exactly on its saved cell
+            path = os.path.join(self.board_folder, info["name"])
+            self.drag = {"tag": None, "dx": 0, "dy": 0}
+            self._disarm_drag()
+            self._hide_tooltip()
+            self.render_board()
+            self._ole_busy = True
+            # idle callback, NOT this poll tick / any event handler
+            self.root.after(30, lambda: self._ole_drag_out_now(path))
+            return True
+
+        def _ole_drag_out_now(self, path):
+            """Run the OLE drag (idle callback) and reflect the result."""
+            try:
+                effect = ole_drag_out([path])
+            except Exception as exc:
+                self._ole_busy = False
+                self.render_board()
+                self.update_board_hint(
+                    "外へドラッグできませんでした（右クリック→"
+                    "デスクトップへ移動も使えます）: %s" % exc)
+                return
+            self._ole_busy = False
+            if effect == DROPEFFECT_MOVE and not os.path.exists(path):
+                # Explorer really moved it: forget the card at once
+                self.positions.pop(os.path.basename(path), None)
+            self._rescan_board()
+            self.render_board()
+            if effect == DROPEFFECT_MOVE:
+                self.update_board_hint("外へ移動しました")
+            elif effect == DROPEFFECT_COPY:
+                self.update_board_hint("外へコピーしました")
+
         # ------------------------------------------------------------ helpers
         @property
         def metrics(self):
@@ -1495,6 +2084,7 @@ def run_gui():
             self.home_base_label.configure(bg=t["bar"],
                                            fg=t["bar_dim"])
             self.board_label.configure(bg=t["bar"], fg=t["bar_fg"])
+            self.size_label.configure(bg=t["bar"], fg=t["bar_fg"])
             self.home_canvas.configure(bg=bg)
             self.canvas.configure(bg=bg)
             self._sync_theme_buttons()
@@ -1552,11 +2142,29 @@ def run_gui():
             bar.pack(side="top", fill="x")
             self._bars.append(bar)
             self._make_button(bar, "← もどる", self.show_home)
-            self._make_button(bar, "＋メモ", self.add_note)
-            self._make_button(bar, "＋ファイル", self.add_files)
-            self.size_button = self._make_button(
-                bar, "大きさ: %d%%" % self.board_percent,
-                self.cycle_percent)
+            # v7: the ＋メモ / ＋ファイル buttons are gone (the user
+            # never used them). Existing note cards still load and
+            # can be edited/deleted via right-click; intake is by
+            # drag & drop. Size is now CHOSEN from a dropdown.
+            self.size_label = tk.Label(
+                bar, text="大きさ", bg=t["bar"], fg=t["bar_fg"],
+                font=("Yu Gothic UI", 10))
+            self.size_label.pack(side="left", padx=(8, 0))
+            self.size_var = tk.StringVar(
+                value="%d%%" % self.board_percent)
+            self.size_menu = tk.OptionMenu(
+                bar, self.size_var,
+                *["%d%%" % p for p in PERCENT_CHOICES],
+                command=self.on_size_selected)
+            self.size_menu.configure(
+                bg=t["btn_bg"], fg=t["btn_fg"],
+                activebackground=t["btn_active"],
+                activeforeground=t["btn_fg"],
+                relief="flat", padx=8, pady=4, highlightthickness=0,
+                font=("Yu Gothic UI", 10))
+            self.size_menu.pack(side="left", padx=4, pady=8)
+            # themed together with the real buttons in apply_theme()
+            self._buttons.append(self.size_menu)
             self.board_theme_btn = self._make_button(
                 bar, "テーマ: %s" % self.theme_name, self.cycle_theme)
             self.board_label = tk.Label(
@@ -1605,13 +2213,27 @@ def run_gui():
                 except Exception:
                     pass
 
-        def cycle_percent(self):
-            self.board_percent = next_percent(self.board_percent)
-            self.size_button.config(
-                text="大きさ: %d%%" % self.board_percent)
+        def on_size_selected(self, value):
+            """Dropdown handler: apply the CHOSEN percent at once."""
+            try:
+                pct = int(str(value).strip().rstrip("%"))
+            except Exception:
+                return
+            if pct not in PERCENT_CHOICES:
+                return
+            self.set_percent(pct)
+
+        def set_percent(self, pct):
+            self.board_percent = pct
+            try:
+                self.size_var.set("%d%%" % pct)
+            except Exception:
+                pass
             self.board_rpc = rows_per_column(
                 max(self.canvas.winfo_height(), 640),
                 self.metrics["cell_h"])
+            # render_board() re-draws at the new size and persists
+            # size_percent for this board via save_board_data()
             self.render_board()
 
         # -------------------------------------------------------- drop setup
@@ -1641,7 +2263,7 @@ def run_gui():
                                               max(int(y), 0)))
 
         def intake_files(self, paths, drop_xy=None):
-            """Shared intake for native drop and the ＋ファイル button."""
+            """Shared intake helper for native drag & drop."""
             if not self.board_folder:
                 return
             try:
@@ -1668,17 +2290,11 @@ def run_gui():
             self.render_board()
             self.update_board_hint("%d 件を追加しました" % len(placed))
 
-        def add_files(self):
-            paths = filedialog.askopenfilenames(
-                title="ボードに入れるファイルを選んでください")
-            if paths:
-                self.intake_files(list(paths))
-
         def update_board_hint(self, extra=""):
             if self.drop.active:
-                hint = "ファイルをここに落とせます（外へ出す時は右クリック→デスクトップへ移動）"
+                hint = "ファイルをここに落とせます（カードを画面の外へドラッグすると外へ移動できます）"
             else:
-                hint = "ドラッグで入らない時は＋ファイルを使ってね"
+                hint = "外へ出す時は右クリック→デスクトップへ移動"
             text = self.board_name
             if extra:
                 text += "：%s（%s）" % (extra, hint)
@@ -1926,8 +2542,7 @@ def run_gui():
             self.board_percent = data.get("size_percent",
                                           DEFAULT_PERCENT)
             self.thumb_cache = {}
-            self.size_button.config(
-                text="大きさ: %d%%" % self.board_percent)
+            self.size_var.set("%d%%" % self.board_percent)
             self.board_rpc = rows_per_column(
                 max(self.canvas.winfo_height(), 640),
                 self.metrics["cell_h"])
@@ -1958,7 +2573,7 @@ def run_gui():
             """
             if self.view != "board" or not self.board_folder:
                 return
-            if self.drag.get("tag"):
+            if self.drag.get("tag") or self._ole_busy:
                 return
             names = {e["name"] for e in scan_folder(self.board_folder)}
             if names != self.known_names:
@@ -1973,6 +2588,7 @@ def run_gui():
             # state first and only then render
             if self.drag.get("tag"):
                 return
+            self._hide_tooltip()
             c = self.canvas
             for tag in list(self.items):
                 c.delete(tag)
@@ -2020,8 +2636,12 @@ def run_gui():
             photo = None
             try:
                 m = self.metrics
+                # thumbnails live in the card's upper (icon) area;
+                # the lower area is reserved for the wrapped name
+                lines = card_name_lines(self.board_percent,
+                                        m["card_h"], m["font"])
                 box = (max(8, m["card_w"] - 14),
-                       max(8, m["card_h"] - m["font"] - 16))
+                       max(8, m["card_h"] - lines * (m["font"] + 3) - 8))
                 with PILImage.open(path) as im:
                     im.thumbnail(box)
                     photo = PILImageTk.PhotoImage(im.convert("RGB"))
@@ -2052,34 +2672,39 @@ def run_gui():
                                     y + m["card_h"], radius),
                 fill=fill, outline=outline, width=1,
                 tags=(tag, "card"))
+            # ---- desktop-icon layout: icon/thumbnail in the upper
+            # area, the NAME wrapped below it over up to 3 lines
+            lines = card_name_lines(self.board_percent,
+                                    m["card_h"], m["font"])
+            display = wrap_card_name(name, m["card_w"] - 10,
+                                     m["font"], lines)
+            line_h = m["font"] + 3
+            text_h = lines * line_h
+            text_top = y + m["card_h"] - text_h - 2
             thumb = self._thumbnail(name) if kind == "image" else None
             if thumb is not None:
                 c.create_image(x + m["card_w"] // 2,
                                y + 3 + thumb.height() // 2,
                                image=thumb, tags=(tag, "card"))
-                label = name
-                max_chars = max(4, m["card_w"] // max(m["font"], 6))
-                if len(label) > max_chars:
-                    label = label[:max_chars - 1] + "…"
-                c.create_text(
-                    x + m["card_w"] // 2,
-                    y + m["card_h"] - m["font"] - 3,
-                    text=label, fill="#eef1ff",
-                    font=("Yu Gothic UI", m["font"]),
-                    width=m["card_w"] - 8, justify="center",
-                    tags=(tag, "card"))
             else:
-                label = icon + " " + name
-                max_chars = max(6, m["card_w"] // 7)
-                if len(label) > max_chars:
-                    label = label[:max_chars - 1] + "…"
-                pad = 8 if self.board_percent >= 50 else 4
-                c.create_text(x + pad, y + pad, text=label, anchor="nw",
-                              fill="#eef1ff", width=m["card_w"] - pad * 2,
-                              font=("Yu Gothic UI", m["font"]),
+                icon_area_h = max(12, text_top - y - 2)
+                icon_size = max(MIN_FONT + 2,
+                                int(round(m["font"] * 1.8)))
+                c.create_text(x + m["card_w"] // 2,
+                              y + icon_area_h // 2,
+                              text=icon, fill="#eef1ff",
+                              font=("Segoe UI Emoji", icon_size),
                               tags=(tag, "card"))
+            name_item = c.create_text(
+                x + m["card_w"] // 2, text_top,
+                text=display, anchor="n", fill="#eef1ff",
+                font=("Yu Gothic UI", m["font"]),
+                width=m["card_w"] - 8, justify="center",
+                tags=(tag, "card"))
             self.items[tag] = {"kind": kind, "name": name,
-                               "note_id": note_id, "x": x, "y": y}
+                               "note_id": note_id, "x": x, "y": y,
+                               "name_text": display,
+                               "name_item": name_item}
             self.card_shapes[tag] = (shape, outline, hover)
             # every visible part of the card (shadow, body, text,
             # thumbnail) carries the same tag, so the whole card is
@@ -2097,12 +2722,44 @@ def run_gui():
             if tag in self.card_shapes:
                 shape, _base, hover = self.card_shapes[tag]
                 self.canvas.itemconfigure(shape, outline=hover, width=2)
+            # full-name tooltip (long names wrap to 3 lines max, so
+            # the complete name lives here) - never during a drag
+            if tag and tag in self.items \
+                    and not self.drag.get("tag"):
+                self._show_tooltip(self.items[tag]["name"],
+                                   event.x_root, event.y_root)
 
         def _card_hover_off(self, event):
             tag = self.card_tag()
             if tag in self.card_shapes:
                 shape, base, _hover = self.card_shapes[tag]
                 self.canvas.itemconfigure(shape, outline=base, width=1)
+            self._hide_tooltip()
+
+        # ------------------------------------------------ tooltip
+        def _show_tooltip(self, text, x_root, y_root):
+            self._hide_tooltip()
+            if not text:
+                return
+            try:
+                win = tk.Toplevel(self.root)
+                win.wm_overrideredirect(True)
+                win.wm_geometry("+%d+%d" % (x_root + 14, y_root + 18))
+                tk.Label(win, text=text, bg="#20242c", fg="#f2f4f8",
+                         font=("Yu Gothic UI", 9), padx=6, pady=3,
+                         wraplength=320, justify="left").pack()
+                self._tooltip_win = win
+            except Exception:
+                self._tooltip_win = None
+
+        def _hide_tooltip(self):
+            win = getattr(self, "_tooltip_win", None)
+            if win is not None:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+                self._tooltip_win = None
 
         def card_tag(self):
             for t in self.canvas.gettags("current"):
@@ -2119,12 +2776,17 @@ def run_gui():
             if not tag or tag not in self.items:
                 return
             info = self.items[tag]
+            self._hide_tooltip()
             self.drag = {"tag": tag, "dx": event.x - info["x"],
                          "dy": event.y - info["y"]}
             self.canvas.tag_raise(tag)
             # v6: NO grab-set (a leftover grab blocked the toolbar
             # in v5); root-level handlers follow the drag instead
             self._arm_drag("board")
+            # v7: watch for the pointer leaving the window (the
+            # OLE drag-out trigger - polled via after(), see
+            # _drag_out_tick)
+            self._start_drag_out_poll()
 
         def on_move(self, event):
             tag = self.drag.get("tag")
@@ -2263,7 +2925,7 @@ def run_gui():
             self.render_board()
 
         def move_to_desktop_ui(self, info):
-            """Move out of a board (v6: the ONLY way out):
+            """Move out of a board (the guaranteed way out):
             move the real file/folder to the Desktop folder; the
             card disappears because the board folder loses the item.
             """

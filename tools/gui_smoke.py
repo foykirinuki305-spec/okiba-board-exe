@@ -7,15 +7,24 @@ Launches the REAL app (OkibaBoard.run_gui) with OKIBA_BASE pointed
 at a temp dir, opens a board with a few files, and drives the GUI
 with synthetic events / button invokes:
 
-  a) toolbar buttons (大きさ / テーマ / ＋メモ / ← もどる) respond
-     and their state changes actually apply;
+  a) toolbar (テーマ / ← もどる) responds and its state changes
+     actually apply; the size DROPDOWN (v7: chosen, not cycled)
+     applies and saves the chosen percent; the removed ＋メモ /
+     ＋ファイル buttons are really gone, while existing note cards
+     still work (added here programmatically);
+  e) LONG NAMES (v7): a file with a 30+ character Japanese name
+     renders desktop-icon style - name text spans multiple lines
+     and shows far more than the old one-line truncation;
   b) a simulated card drag (press / motion / release) moves the
      card and the new cell is what gets saved;
+  f) DRAG-OUT safety on Linux (v7): the OLE drag-out is win32-only,
+     so attempting the trigger path here must change nothing and
+     the UI must stay responsive;
   c) REGRESSION test for the v5 failure the user reported (top
      toolbar stopped responding): drag a card, release OUTSIDE the
      card, then use the toolbar again - it must still respond, the
      drag state must be cleared and no widget grab may remain
-     (v6 uses no grab-set anywhere);
+     (no grab-set anywhere since v6);
   d) the app closes cleanly without exceptions.
 
 Dialogs (メモ input) are stubbed. Exits 0 on success, 1 on failure.
@@ -35,7 +44,8 @@ TMP = tempfile.mkdtemp(prefix="okiba-gui-smoke-")
 BASE = os.path.join(TMP, "OkibaBoards")
 BOARD = os.path.join(BASE, "テスト")
 os.makedirs(BOARD)
-for name in ("a.txt", "b.txt", "c.txt"):
+LONG_NAME = "事件ナレーション用ボイスサンプル_テイク3_最終確認版.wav"
+for name in ("a.txt", "b.txt", "c.txt", LONG_NAME):
     with open(os.path.join(BOARD, name), "w", encoding="utf-8") as f:
         f.write(name)
 os.environ["OKIBA_BASE"] = BASE
@@ -88,17 +98,44 @@ def run_steps(root):
         root.update()
         check("board opens", app.view == "board"
               and app.board_folder == BOARD)
-        check("cards rendered", len(app.items) >= 3,
+        check("cards rendered", len(app.items) >= 4,
               "items=%d" % len(app.items))
+        check("no grab-set in the app source",
+              ".grab_set(" not in open(
+                  OkibaBoard.__file__, encoding="utf-8").read())
 
-        # ---- (a) toolbar: size ----
-        before_pct = app.board_percent
-        app.size_button.invoke()
+        # ---- (e) v7: long names render desktop-icon style ----
+        check("long test name really is long", len(LONG_NAME) >= 30,
+              "%d chars" % len(LONG_NAME))
+        ltag = card_tag(app, LONG_NAME)
+        linfo = app.items[ltag]
+        drawn = linfo.get("name_text", "")
+        flat = drawn.replace("\n", "").replace("…", "")
+        check("long name spans multiple lines", "\n" in drawn,
+              repr(drawn))
+        check("long name shows well past char 20",
+              len(flat) >= 21 and LONG_NAME[19] in flat
+              and flat == LONG_NAME[:len(flat)],
+              "shown=%d chars" % len(flat))
+        canvas_text = app.canvas.itemcget(linfo["name_item"], "text")
+        check("canvas text item matches wrapped name",
+              canvas_text == drawn)
+
+        # ---- (a) v7: size is CHOSEN from the dropdown ----
+        check("＋メモ button is gone",
+              find_button(app, "＋メモ") is None)
+        check("＋ファイル button is gone",
+              find_button(app, "＋ファイル") is None)
+        app.size_var.set("60%")
+        app.on_size_selected(app.size_var.get())
         root.update()
-        check("大きさ button applies", app.board_percent != before_pct,
-              "%s -> %s" % (before_pct, app.board_percent))
-        check("大きさ label updated",
-              str(app.board_percent) in app.size_button.cget("text"))
+        check("dropdown choice applies", app.board_percent == 60,
+              "percent=%s" % app.board_percent)
+        check("dropdown var shows the choice",
+              app.size_var.get() == "60%")
+        saved_pct = OkibaBoard.load_board(BOARD)["size_percent"]
+        check("chosen percent is saved", saved_pct == 60,
+              "saved=%s" % saved_pct)
 
         # ---- (a) toolbar: theme ----
         before_theme = app.theme_name
@@ -109,11 +146,12 @@ def run_steps(root):
         check("テーマ label synced",
               app.theme_name in app.home_theme_btn.cget("text"))
 
-        # ---- (a) toolbar: +メモ (dialog stubbed) ----
+        # ---- notes still work without the removed button ----
         before_notes = len(app.notes)
-        find_button(app, "＋メモ").invoke()
+        app.add_note()  # dialog stubbed; same code path as before
         root.update()
-        check("＋メモ adds a note", len(app.notes) == before_notes + 1)
+        check("note card still adds/displays",
+              len(app.notes) == before_notes + 1)
 
         # ---- (b) simulated drag moves a card ----
         tag = card_tag(app, "a.txt")
@@ -161,11 +199,11 @@ def run_steps(root):
               app.drag.get("tag") is None)
         check("no grab remains after outside release",
               root.grab_current() is None)
-        pct_before = app.board_percent
-        app.size_button.invoke()
+        app.size_var.set("80%")
+        app.on_size_selected(app.size_var.get())
         root.update()
         check("toolbar STILL responds after outside release",
-              app.board_percent != pct_before)
+              app.board_percent == 80)
         theme_before = app.theme_name
         app.board_theme_btn.invoke()
         root.update()
@@ -191,6 +229,41 @@ def run_steps(root):
               root.grab_current() is None)
         app.canvas.event_generate("<ButtonRelease-1>", x=900, y=620)
         root.update()
+
+        # ---- (f) v7 drag-out path on Linux: win32-guarded off, so
+        #      attempting it must change nothing and the UI must
+        #      stay responsive ----
+        payload = OkibaBoard.build_hdrop_payload(["X:\\a b.mp4"])
+        parsed, wide = OkibaBoard.parse_hdrop_payload(payload)
+        check("HDROP payload round-trips",
+              wide and parsed == [os.path.abspath("X:\\a b.mp4")])
+        check("OLE drag-out unavailable off Windows",
+              not OkibaBoard.ole_drag_out_available())
+        tag4 = card_tag(app, "a.txt")
+        info4 = app.items[tag4]
+        cx4, cy4 = info4["x"] + 15, info4["y"] + 15
+        app.canvas.event_generate("<Motion>", x=cx4, y=cy4, warp=True)
+        root.update()
+        app.canvas.event_generate("<ButtonPress-1>", x=cx4, y=cy4)
+        root.update()
+        check("drag-out test drag starts",
+              app.drag.get("tag") == tag4)
+        check("drag-out trigger is a no-op here",
+              app._maybe_begin_drag_out() is False)
+        app._drag_out_tick()  # must not raise / start anything
+        root.update()
+        check("drag still active after trigger attempt",
+              app.drag.get("tag") == tag4)
+        check("no OLE drag was started", app._ole_busy is False)
+        app.canvas.event_generate("<ButtonRelease-1>", x=cx4, y=cy4)
+        root.update()
+        check("drag ends clean after trigger attempt",
+              app.drag.get("tag") is None)
+        app.size_var.set("100%")
+        app.on_size_selected(app.size_var.get())
+        root.update()
+        check("UI responsive after drag-out attempt",
+              app.board_percent == 100)
 
         # ---- (a) toolbar: back to home ----
         find_button(app, "← もどる").invoke()
